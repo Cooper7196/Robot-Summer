@@ -15,7 +15,7 @@ constexpr uint32_t kSerialBaud = 115200;
 const OtosSensor::Pose kTargetPose(0.0f, 100.0f, 0.0f);
 constexpr float kTapeAdcReferenceVolts = 3.3f;
 constexpr float kTapeThresholdVolts = 1.1f;
-constexpr float kMetalAnomalyThresholdHz = 30.0f;
+constexpr float kMetalAnomalyThresholdHz = 50.0f;
 // Adjust this signed value until the elbow just begins moving. Use a
 // negative value to measure friction in the opposite direction.
 constexpr bool kElbowConstantPidTestEnabled = false;
@@ -190,19 +190,18 @@ void delayWithArmLogging(uint32_t durationMs) {
 }
 
 void runPath() {
-  servo1.setAngle(15);
   driveTask.setTargetPose({-4.5f, 95.0f, 0.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
   delay(250);
-  if (metalDetector1.anomalyDetected() || metalDetector2.anomalyDetected()) {
-    servo1.setAngle(15);
+  if ((metalDetector1.anomalyDetected() || metalDetector2.anomalyDetected()) &&
+      false) {
+    servo1.setAngle(0);
     driveTask.setTargetPose({-6, 68, -43.0f}, 1.0f, true);
     driveTask.waitUntilMotionFinished(10000);
     driveTask.setTargetPose({2.5, 77, -40.0f}, 1.0f);
     driveTask.waitUntilMotionFinished(10000);
-    armTask.setTargetAngles({47.0f, -100.0f});
     delay(500);
-    servo1.setAngle(90);
+    servo1.setAngle(50);
     delay(500);
     armTask.setTargetAngles({71.0f, -94.0f});
     armTask.waitUntilSettled(1500);
@@ -210,8 +209,106 @@ void runPath() {
     armTask.waitUntilSettled(1500);
     armTask.setTargetAngles({124.0f, -168.0f});
     armTask.waitUntilSettled(1500);
-    servo1.setAngle(15);
+    servo1.setAngle(0);
   }
+
+  driveTask.setTargetPose({11.0f, 155.0f, 0.0f}, 1.0f, true);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-4.5f, 170.0f, 61.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  delay(250);
+  if (metalDetector2.anomalyDetected() && false) {
+    servo1.setAngle(0);
+    driveTask.setTargetPose({-19, 180, 61.0f}, 1.0f, true);
+    driveTask.waitUntilMotionFinished(10000);
+    driveTask.setTargetPose({-18, 184, -180.0f}, 1.0f);
+    driveTask.waitUntilMotionFinished(10000);
+    driveTask.setTargetPose({-18, 174, -180.0f}, 1.0f);
+    delay(500);
+    // servo1.setAngle(50);
+  }
+
+  if (metalDetector1.anomalyDetected() && false) {
+    servo1.setAngle(0);
+    driveTask.setTargetPose({-30, 185, 61.0f}, 1.0f);
+    driveTask.waitUntilMotionFinished(10000);
+    driveTask.setTargetPose({-28, 193, -90.0f}, 1.0f);
+    driveTask.waitUntilMotionFinished(10000);
+    driveTask.setTargetPose({-19, 193, -90.0f}, 1.0f);
+    driveTask.waitUntilMotionFinished(10000);
+    delay(500);
+    servo1.setAngle(50);
+  }
+  driveTask.setTargetPose({-28.5f, 187.0f, 90.0f}, 1.0f, true);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-47.0f, 184.0f, 145.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  delay(250);
+  if ((metalDetector1.anomalyDetected() || metalDetector2.anomalyDetected()) &&
+      false) {
+    servo1.setAngle(0);
+    driveTask.setTargetPose({-30, 189, 121.0f}, 1.0f, true);
+    driveTask.waitUntilMotionFinished(10000);
+    driveTask.setTargetPose({-34, 194, 88.0f}, 1.0f, true);
+    driveTask.waitUntilMotionFinished(10000);
+    driveTask.setTargetPose({-43, 194, 88.0f}, 1.0f);
+    driveTask.waitUntilMotionFinished(10000);
+    servo1.setAngle(90);
+  }
+
+  driveTask.setTargetPose({-55.0f, 184.0f, 180.0f}, 1.0f, true);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-55.0f, 150.0f, 180.0f}, 1.0f, true);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-55.0f, 27.0f, 180.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-65.0f, 9.0f, 134.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  delay(250);
+  if ((metalDetector1.anomalyDetected() || metalDetector2.anomalyDetected()) &&
+      false) {
+    servo1.setAngle(0);
+    delay(250);
+    driveTask.setTargetPose({-76.0f, 22.0f, 147.0f}, 1.0f);
+    driveTask.waitUntilMotionFinished(10000);
+    driveTask.setTargetPose({-74.5f, 20.0f, -140.0f}, 1.0f);
+    driveTask.waitUntilMotionFinished(10000);
+    driveTask.setTargetPose({-65.0f, 12.5f, -140.0f}, 1.0f);
+    driveTask.waitUntilMotionFinished(10000);
+    delay(250);
+    servo1.setAngle(50);
+  }
+
+  driveTask.setTargetPose({-67, 21.5, 78}, 1.0);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-77, 22, 78}, 1.0);
+  driveTask.waitUntilMotionFinished(10000);
+  delay(250);
+  servo1.setAngle(50);
+  /*
+  driveTask.setTargetPose({-72.0f, 13.0f, 134.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-100.0f, 4.0f, 90.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-130.0f, 4.0f, 90.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-144.0f, 97.0f, -90.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-128.0f, 97.0f, -90.0f}, 1.0f);
+
+  servo1.setAngle(15);
+  delay(3000);
+  armTask.setTargetAngles({75.0f, -90.0f});
+  delayWithArmLogging(2000);
+  armTask.setTargetAngles({72.0f, -116.0f});
+  delayWithArmLogging(2000);
+  servo1.setAngle(115);
+  delayWithArmLogging(1000);
+  driveTask.setTargetPose({-155.0f, 97.0f, -90.0f}, 1.0f, true);
+  driveTask.waitUntilMotionFinished(10000);
+  servo1.setAngle(15);
+  */
+
   while (true) {
     // Log drive pose and arm pose
     OtosSensor::Pose currentPose;
@@ -230,60 +327,6 @@ void runPath() {
       }
     }
   }
-
-  /*  driveTask.setTargetPose({11.0f, 155.0f, 0.0f}, 1.0f, true);
-    driveTask.waitUntilMotionFinished(10000);
-    driveTask.setTargetPose({-4.5f, 170.0f, 61.0f}, 1.0f);
-    driveTask.waitUntilMotionFinished(10000);
-    delay(250);
-    if (metalDetector1.anomalyDetected() || metalDetector2.anomalyDetected())
-    { servo1.setAngle(15); delay(250); servo1.setAngle(90);
-    }
-
-    driveTask.setTargetPose({-28.5f, 187.0f, 90.0f}, 1.0f, true);
-    driveTask.waitUntilMotionFinished(10000);
-    driveTask.setTargetPose({-47.0f, 184.0f, 145.0f}, 1.0f);
-    driveTask.waitUntilMotionFinished(10000);
-    delay(250);
-    if (metalDetector1.anomalyDetected() || metalDetector2.anomalyDetected())
-    { servo1.setAngle(15); delay(250); servo1.setAngle(90);
-    }
-
-    driveTask.setTargetPose({-55.0f, 184.0f, 180.0f}, 1.0f, true);
-    driveTask.waitUntilMotionFinished(10000);
-    driveTask.setTargetPose({-55.0f, 150.0f, 180.0f}, 1.0f, true);
-    driveTask.waitUntilMotionFinished(10000);
-    driveTask.setTargetPose({-55.0f, 27.0f, 180.0f}, 1.0f);
-    driveTask.waitUntilMotionFinished(10000);
-    driveTask.setTargetPose({-65.0f, 9.0f, 134.0f}, 1.0f);
-    driveTask.waitUntilMotionFinished(10000);
-    delay(250);
-    if (metalDetector1.anomalyDetected() || metalDetector2.anomalyDetected())
-    { servo1.setAngle(15); delay(250); servo1.setAngle(90);
-    }
-
-    driveTask.setTargetPose({-72.0f, 13.0f, 134.0f}, 1.0f);
-    driveTask.waitUntilMotionFinished(10000);
-    driveTask.setTargetPose({-100.0f, 4.0f, 90.0f}, 1.0f);
-    driveTask.waitUntilMotionFinished(10000);
-    driveTask.setTargetPose({-130.0f, 4.0f, 90.0f}, 1.0f);
-    driveTask.waitUntilMotionFinished(10000);
-    driveTask.setTargetPose({-144.0f, 97.0f, -90.0f}, 1.0f);
-    driveTask.waitUntilMotionFinished(10000);
-    driveTask.setTargetPose({-128.0f, 97.0f, -90.0f}, 1.0f);
-
-    servo1.setAngle(15);
-    delay(3000);
-    armTask.setTargetAngles({75.0f, -90.0f});
-    delayWithArmLogging(2000);
-    armTask.setTargetAngles({72.0f, -116.0f});
-    delayWithArmLogging(2000);
-    servo1.setAngle(115);
-    delayWithArmLogging(1000);
-    driveTask.setTargetPose({-155.0f, 97.0f, -90.0f}, 1.0f, true);
-    driveTask.waitUntilMotionFinished(10000);
-    servo1.setAngle(15);
-    */
 }
 
 void setup() {
@@ -358,10 +401,10 @@ void setup() {
         armConfig.gravityA1Percent != 0.0f ||
         armConfig.gravityA12Percent != 0.0f ||
         armConfig.gravityA2Percent != 0.0f;
-    gravityCompensationReady =
-        gravityCompensationConfigured && armTask.setTargetAngles({90, 90});
-    Serial.println("Gravity compensation " +
-                   String(gravityCompensationReady ? "ready" : "not ready"));
+    // gravityCompensationReady =
+    //     gravityCompensationConfigured && armTask.setTargetAngles({90, 90});
+    // Serial.println("Gravity compensation " +
+    //                String(gravityCompensationReady ? "ready" : "not ready"));
 
     // Joint-angle commands return immediately and execute in the arm task:
     // while (true) {
@@ -377,7 +420,7 @@ void setup() {
 
   // Reset the OTOS coordinate system through its owning task:
   driveTask.setOtosPose({0.0f, 0.0f, 0.0f});
-  driveTask.setTargetPose({0.0f, 0.0f, 0.0f}, 1.0f);
+  driveTask.setTargetPose({0.0f, 2.0f, 0.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(1000);
   // hbridge1.setSpeedPercent(20.0f);
   // hbridge2.setSpeedPercent(20.0f);
@@ -399,6 +442,7 @@ void setup() {
   // }
   // servo1.setAngle(115);
   armTask.setTargetAngles({47.0f, -100.0f});
+  servo1.setAngle(0);
   runPath();
 
   // while (true) {
