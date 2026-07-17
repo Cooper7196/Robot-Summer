@@ -1,0 +1,10 @@
+CompileFlags:
+  CompilationDatabase: .
+  Compiler: C:/Users/cbros/.platformio/packages/toolchain-xtensa-esp32s3/bin/xtensa-esp32s3-elf-g++.exe
+  Remove:
+    - -mlongcalls
+    - -fstrict-volatile-bitfields
+    - -fno-tree-switch-conversion
+    - -fno-jump-tables
+    - -freorder-blocks
+    - -fstack-protector

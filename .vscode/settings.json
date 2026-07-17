@@ -1,0 +1,11 @@
+{
+    "clangd.path": "C:\\Users\\cbros\\AppData\\Roaming\\Code\\User\\globalStorage\\llvm-vs-code-extensions.vscode-clangd\\install\\21.1.0\\clangd_21.1.0\\bin\\clangd.exe",
+    "clangd.arguments": [
+        "--enable-config",
+        "--background-index",
+        "--compile-commands-dir=${workspaceFolder}",
+        "--query-driver=C:/Users/cbros/.platformio/packages/toolchain-xtensa-esp32s3/bin/xtensa-esp32s3-elf-*.exe,C:\\Users\\cbros\\.platformio\\packages\\toolchain-xtensa-esp32s3\\bin\\xtensa-esp32s3-elf-*.exe"
+    ],
+    "C_Cpp.intelliSenseEngine": "disabled",
+    "C_Cpp.errorSquiggles": "disabled"
+}
