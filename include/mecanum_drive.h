@@ -31,6 +31,7 @@ public:
   static constexpr float POSE_HEADING_KD = 0.0011f;
   static constexpr float POSE_INTERMEDIARY_MIN_TRANSLATION_POWER = 0.20f;
   static constexpr float POSE_INTERMEDIARY_MIN_HEADING_POWER = 0.12f;
+  static constexpr uint32_t DISABLED_STOP_REASSERT_PERIOD_MS = 100;
 
   MecanumDrive(Motor &frontLeft, Motor &frontRight, Motor &backLeft,
                Motor &backRight, int8_t enablePin = NO_ENABLE_PIN);
@@ -50,6 +51,10 @@ public:
                    bool intermediaryPosition = false);
   void resetPosePid();
   void setMaxOutputPercent(float maxOutputPercent);
+  // Must be polled even while no drive command is active. The PCA9685 holds
+  // its last output, so checking the switch only when commanding a motor can
+  // leave stale PWM applied after the switch is turned off.
+  bool stopIfDisabled();
   void stop();
   void setWheelSpeeds(float frontLeft, float frontRight, float backLeft,
                       float backRight);
@@ -89,4 +94,6 @@ private:
   bool targetIsIntermediary_;
   bool hasPoseTarget_;
   bool atPoseTarget_;
+  bool outputsStopped_;
+  uint32_t lastDisabledStopMs_;
 };

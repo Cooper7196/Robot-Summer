@@ -10,7 +10,8 @@ MecanumDrive::MecanumDrive(Motor &frontLeft, Motor &frontRight, Motor &backLeft,
       lastHeadingError_(0.0f), lastPose_(), hasLastPose_(false),
       pathStartPose_(), hasPathStartPose_(false), targetPose_(),
       targetMaxPower_(1.0f), targetIsIntermediary_(false),
-      hasPoseTarget_(false), atPoseTarget_(false) {}
+      hasPoseTarget_(false), atPoseTarget_(false), outputsStopped_(true),
+      lastDisabledStopMs_(0) {}
 
 void MecanumDrive::begin() {
   if (enablePin_ != NO_ENABLE_PIN) {
@@ -327,11 +328,35 @@ void MecanumDrive::setMaxOutputPercent(float maxOutputPercent) {
   maxOutputPercent_ = clamp(maxOutputPercent, 0.0f, 100.0f);
 }
 
+bool MecanumDrive::stopIfDisabled() {
+  if (enabled()) {
+    lastDisabledStopMs_ = 0;
+    return false;
+  }
+
+  const uint32_t nowMs = millis();
+  if (!outputsStopped_ || lastDisabledStopMs_ == 0 ||
+      nowMs - lastDisabledStopMs_ >= DISABLED_STOP_REASSERT_PERIOD_MS) {
+    // Force a periodic rewrite so a transient I2C problem cannot leave stale
+    // PWM latched, without flooding the shared bus for the entire off period.
+    outputsStopped_ = false;
+    stop();
+    lastDisabledStopMs_ = nowMs == 0 ? 1 : nowMs;
+  }
+  resetPosePid();
+  return true;
+}
+
 void MecanumDrive::stop() {
+  if (outputsStopped_) {
+    return;
+  }
+
   frontLeft_->stop();
   frontRight_->stop();
   backLeft_->stop();
   backRight_->stop();
+  outputsStopped_ = true;
 }
 
 float MecanumDrive::clamp(float value, float minValue, float maxValue) {
@@ -419,6 +444,7 @@ void MecanumDrive::setWheelSpeeds(float frontLeft, float frontRight,
   backRightPercent =
       clamp(backRightPercent, -maxOutputPercent_, maxOutputPercent_);
 
+  outputsStopped_ = false;
   frontLeft_->setSpeedPercent(frontLeftPercent);
   frontRight_->setSpeedPercent(frontRightPercent);
   backLeft_->setSpeedPercent(backLeftPercent);

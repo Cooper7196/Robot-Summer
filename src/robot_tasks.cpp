@@ -117,6 +117,13 @@ void DriveTask::run() {
   TickType_t lastWake = xTaskGetTickCount();
   uint32_t lastPoseLogMs = 0;
   for (;;) {
+    // Poll the physical enable switch independently of motion commands. The
+    // PWM expander retains its last duty cycle while the drive is otherwise
+    // idle, including after an intermediary waypoint.
+    xSemaphoreTake(pwmMutex_, portMAX_DELAY);
+    drive_->stopIfDisabled();
+    xSemaphoreGive(pwmMutex_);
+
     Command command;
     if (xQueueReceive(commandQueue_, &command, 0) == pdTRUE) {
       if (command.type == CommandType::TargetPose) {
