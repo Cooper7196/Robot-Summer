@@ -25,10 +25,12 @@ public:
 
   bool begin(float initialAngleDeg = 90.0f);
   bool setAngle(float angleDeg);
+  bool enable();
   void disable();
 
   float commandedAngle() const;
   bool initialized() const;
+  bool outputEnabled() const;
 
 private:
   static float clamp(float value, float minValue, float maxValue);
@@ -38,4 +40,5 @@ private:
   Config config_;
   float commandedAngleDeg_;
   bool initialized_;
+  bool outputEnabled_;
 };

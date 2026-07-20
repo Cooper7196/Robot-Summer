@@ -2,7 +2,7 @@
 
 AngleServo::AngleServo(uint8_t pin, uint8_t ledcChannel, const Config &config)
     : pin_(pin), ledcChannel_(ledcChannel), config_(config),
-      commandedAngleDeg_(0.0f), initialized_(false) {}
+      commandedAngleDeg_(0.0f), initialized_(false), outputEnabled_(false) {}
 
 bool AngleServo::begin(float initialAngleDeg) {
   if (config_.minAngleDeg >= config_.maxAngleDeg ||
@@ -18,11 +18,12 @@ bool AngleServo::begin(float initialAngleDeg) {
 
   ledcAttachPin(pin_, ledcChannel_);
   initialized_ = true;
+  outputEnabled_ = true;
   return setAngle(initialAngleDeg);
 }
 
 bool AngleServo::setAngle(float angleDeg) {
-  if (!initialized_ || !isfinite(angleDeg)) {
+  if (!initialized_ || !outputEnabled_ || !isfinite(angleDeg)) {
     return false;
   }
 
@@ -39,15 +40,33 @@ bool AngleServo::setAngle(float angleDeg) {
   return true;
 }
 
+bool AngleServo::enable() {
+  if (!initialized_) {
+    return false;
+  }
+
+  if (!outputEnabled_) {
+    ledcAttachPin(pin_, ledcChannel_);
+    outputEnabled_ = true;
+  }
+  return setAngle(commandedAngleDeg_);
+}
+
 void AngleServo::disable() {
-  if (initialized_) {
+  if (initialized_ && outputEnabled_) {
+    // Stop the pulse train before disconnecting LEDC from the physical pin.
     ledcWrite(ledcChannel_, 0);
+    ledcDetachPin(pin_);
+    pinMode(pin_, INPUT);
+    outputEnabled_ = false;
   }
 }
 
 float AngleServo::commandedAngle() const { return commandedAngleDeg_; }
 
 bool AngleServo::initialized() const { return initialized_; }
+
+bool AngleServo::outputEnabled() const { return outputEnabled_; }
 
 float AngleServo::clamp(float value, float minValue, float maxValue) {
   if (value < minValue) {
