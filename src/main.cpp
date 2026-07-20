@@ -19,12 +19,12 @@ constexpr float kMetalAnomalyThresholdHz = 50.0f;
 // Adjust this signed value until the elbow just begins moving. Use a
 // negative value to measure friction in the opposite direction.
 constexpr bool kElbowConstantPidTestEnabled = false;
-constexpr float kElbowConstantPidTestPercent = -13.0f;
+constexpr float kElbowConstantPidTestPercent = -9.0f;
 
 // Replace these with each AS5600's raw reading at the position that should be
 // reported as 0 degrees.
 constexpr float kShoulderEncoderDegAtZero = 10.2f;
-constexpr float kElbowEncoderDegAtZero = 105.8f;
+constexpr float kElbowEncoderDegAtZero = (286.8f);
 
 // Mechanical joint limits in calibrated joint coordinates. Targets outside
 // these ranges are rejected rather than clamped.
@@ -32,6 +32,9 @@ constexpr float kShoulderMinAngleDeg = -180.0f;
 constexpr float kShoulderMaxAngleDeg = 180.0f;
 constexpr float kElbowMinAngleDeg = -180.0f;
 constexpr float kElbowMaxAngleDeg = 180.0f;
+constexpr float clawOpenAngle = 50.0f;
+constexpr float clawClosedAngle = 130.0f;
+constexpr float clawFullyClosedAngle = 180.0f;
 
 uint16_t adcCountFromVolts(float volts) {
   if (volts <= 0.0f) {
