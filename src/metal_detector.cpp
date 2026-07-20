@@ -9,14 +9,18 @@ MetalDetector::MetalDetector(uint8_t inputPin, pcnt_unit_t unit)
 MetalDetector::MetalDetector(uint8_t inputPin, pcnt_unit_t unit,
                              const Config &config)
     : inputPin_(inputPin), unit_(unit), config_(config), reading_(),
-      sampleStartUs_(0), calibrationCount_(0), initialized_(false),
-      stateMutex_(nullptr), taskHandle_(nullptr) {}
+      sampleStartUs_(0), calibrationCount_(0), deviationSamples_{},
+      deviationSumHz_(0.0f), deviationSampleCount_(0),
+      deviationSampleIndex_(0), initialized_(false), stateMutex_(nullptr),
+      taskHandle_(nullptr) {}
 
 bool MetalDetector::begin() {
   if (initialized_ || unit_ < PCNT_UNIT_0 || unit_ >= PCNT_UNIT_MAX ||
       config_.sampleWindowMs == 0 || config_.calibrationSamples == 0 ||
       config_.baselineTimeConstantSeconds <= 0.0f ||
       config_.anomalyThresholdHz < 0.0f ||
+      config_.deviationAverageSamples == 0 ||
+      config_.deviationAverageSamples > MAX_DEVIATION_AVERAGE_SAMPLES ||
       config_.clearThresholdFraction < 0.0f ||
       config_.clearThresholdFraction > 1.0f ||
       config_.glitchFilterCycles > 1023 || config_.taskStackSize == 0) {
@@ -143,6 +147,11 @@ bool MetalDetector::update() {
             ? reading_.deviationHz / reading_.baselineHz
             : 0.0f;
     reading_.anomaly = true;
+    deviationSumHz_ = 0.0f;
+    deviationSampleCount_ = 0;
+    deviationSampleIndex_ = 0;
+    reading_.averagedDeviationHz = 0.0f;
+    reading_.averagedSampleCount = 0;
     xSemaphoreGive(stateMutex_);
     return true;
   }
@@ -157,13 +166,31 @@ bool MetalDetector::update() {
     reading_.baselineReady = calibrationCount_ >= config_.calibrationSamples;
     reading_.anomaly = false;
   } else {
-    const float absoluteDeviation =
-        fabsf(reading_.frequencyHz - reading_.baselineHz);
+    const float sampleDeviation = reading_.frequencyHz - reading_.baselineHz;
+    if (deviationSampleCount_ < config_.deviationAverageSamples) {
+      deviationSamples_[deviationSampleIndex_] = sampleDeviation;
+      deviationSumHz_ += sampleDeviation;
+      ++deviationSampleCount_;
+    } else {
+      deviationSumHz_ -= deviationSamples_[deviationSampleIndex_];
+      deviationSamples_[deviationSampleIndex_] = sampleDeviation;
+      deviationSumHz_ += sampleDeviation;
+    }
+    deviationSampleIndex_ = static_cast<uint8_t>(
+        (deviationSampleIndex_ + 1) % config_.deviationAverageSamples);
+    reading_.averagedSampleCount = deviationSampleCount_;
+    reading_.averagedDeviationHz =
+        deviationSumHz_ / static_cast<float>(deviationSampleCount_);
+
     const float threshold = config_.anomalyThresholdHz;
     const float activeThreshold =
         reading_.anomaly ? threshold * config_.clearThresholdFraction
                          : threshold;
-    reading_.anomaly = absoluteDeviation >= activeThreshold;
+    // Do not report metal until a complete window is available. Consistent
+    // positive or negative shifts remain; isolated spikes are averaged down.
+    reading_.anomaly =
+        deviationSampleCount_ >= config_.deviationAverageSamples &&
+        fabsf(reading_.averagedDeviationHz) >= activeThreshold;
 
     // Freeze the baseline while anomalous, otherwise a stationary metal
     // target would gradually become the new normal.
@@ -217,6 +244,12 @@ void MetalDetector::resetBaseline() {
     xSemaphoreTake(stateMutex_, portMAX_DELAY);
   }
   calibrationCount_ = 0;
+  deviationSumHz_ = 0.0f;
+  deviationSampleCount_ = 0;
+  deviationSampleIndex_ = 0;
+  for (uint8_t i = 0; i < MAX_DEVIATION_AVERAGE_SAMPLES; ++i) {
+    deviationSamples_[i] = 0.0f;
+  }
   reading_ = Reading();
   if (stateMutex_ != nullptr) {
     xSemaphoreGive(stateMutex_);
