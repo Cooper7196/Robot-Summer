@@ -20,8 +20,8 @@ constexpr uint8_t ENCODER_I2C_SCL_PIN = 9;
 constexpr uint8_t SERVO1_PWM_PIN = 11;
 constexpr uint8_t SERVO2_PWM_PIN = 12;
 
-constexpr uint8_t MD1_PIN = 13;
-constexpr uint8_t MD2_PIN = 14;
+constexpr uint8_t MD_LEFT_PIN = 13;
+constexpr uint8_t MD_RIGHT_PIN = 14;
 
 constexpr uint8_t PWM_EXPANDER_SCL_PIN = 15;
 constexpr uint8_t PWM_EXPANDER_SDA_PIN = 16;
