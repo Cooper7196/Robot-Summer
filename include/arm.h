@@ -34,16 +34,14 @@ public:
     bool constantPidTestEnabled;
     float constantPidOutputPercent;
     float velocityAlpha;
-    float maxVelocityDegPerSec;
-    float maxAccelerationDegPerSec2;
-    float positiveFrictionPercent;
-    float negativeFrictionPercent;
-    float fullFrictionErrorDeg;
+    float positiveStaticFrictionPercent;
+    float negativeStaticFrictionPercent;
     float positionToleranceDeg;
     float integralZoneDeg;
     float integralLimitDegSec;
     float integralDecay;
     float maxPwmPercent;
+    float maxOutputSlewPercentPerSec;
 
     JointConfig();
   };
@@ -51,6 +49,8 @@ public:
   struct Config {
     float shoulderLinkCm;
     float elbowLinkCm;
+    // Maximum speed of the commanded end effector along an XY path.
+    float maxCartesianSpeedCmPerSec;
     uint32_t updatePeriodUs;
     uint32_t maxLoopDelayUs;
     bool latchFaults;
@@ -67,9 +67,7 @@ public:
 
   struct JointTelemetry {
     float commandedPositionDeg;
-    float targetPositionDeg;
     float measuredPositionDeg;
-    float desiredVelocityDegPerSec;
     float measuredVelocityDegPerSec;
     float positionErrorDeg;
     float pOutputPercent;
@@ -81,6 +79,7 @@ public:
     float unclampedOutputPercent;
     float finalPwmPercent;
     bool saturated;
+    bool slewLimited;
   };
 
   struct Telemetry {
@@ -94,6 +93,8 @@ public:
       As5600Encoder &elbowEncoder, const Config &config = Config());
 
   bool setTargetAngles(const JointAngles &targetAngles);
+  // Targets are absolute coordinates from the shoulder pivot. Position
+  // commands are interpolated in XY space, producing a straight-line path.
   bool setTargetPosition(const Position &targetPosition, bool elbowUp = false);
   bool update();
   bool moveToAngles(const JointAngles &targetAngles, uint32_t timeoutMs = 5000);
@@ -101,6 +102,9 @@ public:
                       uint32_t timeoutMs = 5000);
 
   bool readAngles(JointAngles *angles);
+  // Converts measured or commanded joint angles to an end-effector position
+  // in centimeters relative to the shoulder pivot.
+  Position positionFromAngles(const JointAngles &angles) const;
   bool getTelemetry(Telemetry *telemetry) const;
   bool atTarget() const;
   bool faulted() const;
@@ -115,12 +119,14 @@ private:
     float positionDeg;
     float previousPositionDeg;
     float previousWrappedPositionDeg;
+    float previousCommandedPositionDeg;
     float velocityDegPerSec;
-    float targetPositionDeg;
-    float desiredVelocityDegPerSec;
+    float commandedVelocityDegPerSec;
     float integralDegSec;
+    float outputPercent;
     bool encoderInitialized;
     bool controllerInitialized;
+    bool commandInitialized;
     bool outputSaturated;
 
     JointState();
@@ -134,6 +140,9 @@ private:
   static bool solveInverseKinematics(const Position &targetPosition,
                                      float shoulderLinkCm, float elbowLinkCm,
                                      bool elbowUp, JointAngles *angles);
+  static Position solveForwardKinematics(const JointAngles &angles,
+                                         float shoulderLinkCm,
+                                         float elbowLinkCm);
 
   bool readJointPosition(As5600Encoder *encoder, const JointConfig &config,
                          JointState *state, float *positionDeg);
@@ -149,11 +158,17 @@ private:
   As5600Encoder *elbowEncoder_;
   Config config_;
   JointAngles commandedAngles_;
+  Position targetPosition_;
+  Position commandedPosition_;
   JointState shoulderState_;
   JointState elbowState_;
   Telemetry telemetry_;
   uint32_t lastUpdateUs_;
   bool hasTarget_;
+  bool cartesianTarget_;
+  bool cartesianPathInitialized_;
+  bool cartesianPathComplete_;
+  bool elbowUp_;
   bool atTarget_;
   bool faulted_;
 };
