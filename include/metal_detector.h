@@ -25,7 +25,7 @@ public:
     // frequency and baseline is at least this many hertz.
     float anomalyThresholdHz = 100.0f;
     // Require this many consecutive usable deviations and compare their
-    // rolling mean against the anomaly threshold. More samples reject brief
+    // rolling median against the anomaly threshold. More samples reject brief
     // spikes, at the cost of sampleWindowMs of additional response time each.
     uint8_t deviationAverageSamples = 3;
     float clearThresholdFraction = 0.70f;
@@ -81,7 +81,6 @@ private:
   int64_t sampleStartUs_;
   uint16_t calibrationCount_;
   float deviationSamples_[MAX_DEVIATION_AVERAGE_SAMPLES];
-  float deviationSumHz_;
   uint8_t deviationSampleCount_;
   uint8_t deviationSampleIndex_;
   bool initialized_;
