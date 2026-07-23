@@ -4,6 +4,7 @@ namespace {
 constexpr TickType_t kTaskPeriod = pdMS_TO_TICKS(4);
 constexpr uint32_t kOtosReadTimeoutMs = 50;
 constexpr uint32_t kPoseLogPeriodMs = 100;
+constexpr TickType_t kCalibrationSettleDelay = pdMS_TO_TICKS(250);
 } // namespace
 
 DriveTask::DriveTask(MecanumDrive &drive, OtosSensor &otos)
@@ -211,6 +212,7 @@ void DriveTask::run() {
         xSemaphoreGive(pwmMutex_);
         updateStatus(false, false);
 
+        vTaskDelay(kCalibrationSettleDelay);
         const bool started =
             otos_->startGyroCalibration(command.gyroCalibrationSamples);
         if (started) {

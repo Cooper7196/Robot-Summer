@@ -21,6 +21,8 @@ Arm::Config::Config()
     : shoulderLinkCm(19.0f), elbowLinkCm(23.8675f),
       maxCartesianSpeedCmPerSec(10.0f), updatePeriodUs(4000),
       maxLoopDelayUs(50000), latchFaults(false), motorDisablePin(-1),
+      gravityHoldSettleTimeMs(250), gravityHoldMaxVelocityDegPerSec(2.0f),
+      pidReenableDriftDeg(2.5f),
       gravityA1Percent(0.0f), gravityA12Percent(0.0f), gravityA2Percent(0.0f),
       shoulder(), elbow() {}
 
@@ -42,7 +44,8 @@ Arm::Arm(Motor &shoulderMotor, Motor &elbowMotor,
       lastUpdateUs_(0),
       hasTarget_(false), cartesianTarget_(false),
       cartesianPathInitialized_(false), cartesianPathComplete_(false),
-      elbowUp_(false), atTarget_(false), faulted_(false) {}
+      elbowUp_(false), atTarget_(false), gravityHoldActive_(false),
+      gravityHoldSettledSinceUs_(0), gravityHoldAngles_(), faulted_(false) {}
 
 bool Arm::setTargetAngles(const JointAngles &targetAngles) {
   JointAngles fitted;
@@ -188,12 +191,22 @@ bool Arm::update() {
   const float elbowGravity =
       config_.gravityA2Percent * cosf(forearmAbsoluteRad);
 
+  if (gravityHoldActive_ &&
+      (fabsf(shoulderPositionDeg - gravityHoldAngles_.shoulderDeg) >
+           fabsf(config_.pidReenableDriftDeg) ||
+       fabsf(elbowPositionDeg - gravityHoldAngles_.elbowDeg) >
+           fabsf(config_.pidReenableDriftDeg))) {
+    gravityHoldActive_ = false;
+    gravityHoldSettledSinceUs_ = 0;
+  }
+
+  const bool feedbackEnabled = !gravityHoldActive_;
   updateJoint(shoulderMotor_, config_.shoulder, &shoulderState_,
               commandedAngles_.shoulderDeg, shoulderPositionDeg, dtSec,
-              shoulderGravity, &telemetry_.shoulder);
+              shoulderGravity, feedbackEnabled, &telemetry_.shoulder);
   updateJoint(elbowMotor_, config_.elbow, &elbowState_,
               commandedAngles_.elbowDeg, elbowPositionDeg, dtSec, elbowGravity,
-              &telemetry_.elbow);
+              feedbackEnabled, &telemetry_.elbow);
 
   const bool shoulderAtTarget =
       fabsf(telemetry_.shoulder.commandedPositionDeg - shoulderPositionDeg) <=
@@ -203,6 +216,29 @@ bool Arm::update() {
           config_.elbow.positionToleranceDeg;
   atTarget_ = shoulderAtTarget && elbowAtTarget &&
               (!cartesianTarget_ || cartesianPathComplete_);
+  const bool velocitySettled =
+      fabsf(telemetry_.shoulder.measuredVelocityDegPerSec) <=
+          fabsf(config_.gravityHoldMaxVelocityDegPerSec) &&
+      fabsf(telemetry_.elbow.measuredVelocityDegPerSec) <=
+          fabsf(config_.gravityHoldMaxVelocityDegPerSec);
+  if (!gravityHoldActive_) {
+    if (atTarget_ && velocitySettled) {
+      if (gravityHoldSettledSinceUs_ == 0) {
+        gravityHoldSettledSinceUs_ = nowUs;
+      }
+      const uint32_t requiredSettleUs =
+          config_.gravityHoldSettleTimeMs * 1000UL;
+      if (requiredSettleUs == 0 ||
+          nowUs - gravityHoldSettledSinceUs_ >= requiredSettleUs) {
+        gravityHoldActive_ = true;
+        gravityHoldAngles_ =
+            JointAngles(shoulderPositionDeg, elbowPositionDeg);
+      }
+    } else {
+      gravityHoldSettledSinceUs_ = 0;
+    }
+  }
+  telemetry_.gravityHoldActive = gravityHoldActive_;
   telemetry_.faulted = false;
   telemetry_.timestampUs = nowUs;
   return atTarget_;
@@ -287,6 +323,9 @@ void Arm::resetPid() {
   elbowState_.controllerInitialized = false;
   elbowState_.commandInitialized = false;
   elbowState_.outputSaturated = false;
+  gravityHoldActive_ = false;
+  gravityHoldSettledSinceUs_ = 0;
+  telemetry_.gravityHoldActive = false;
   lastUpdateUs_ = 0;
 }
 
@@ -429,13 +468,16 @@ void Arm::enterFault() {
   elbowState_.controllerInitialized = false;
   elbowState_.commandInitialized = false;
   elbowState_.outputSaturated = false;
+  gravityHoldActive_ = false;
+  gravityHoldSettledSinceUs_ = 0;
+  telemetry_.gravityHoldActive = false;
   lastUpdateUs_ = 0;
 }
 
 float Arm::updateJoint(Motor *motor, const JointConfig &config,
                        JointState *state, float commandedPositionDeg,
                        float positionDeg, float dtSec, float gravityPercent,
-                       JointTelemetry *telemetry) {
+                       bool feedbackEnabled, JointTelemetry *telemetry) {
   if (!state->controllerInitialized) {
     state->previousPositionDeg = positionDeg;
     state->velocityDegPerSec = 0.0f;
@@ -464,7 +506,7 @@ float Arm::updateJoint(Motor *motor, const JointConfig &config,
   // Derivative on measurement avoids a derivative kick when the command changes.
   float dOutput = -config.kD * state->velocityDegPerSec;
 
-  if (config.constantPidTestEnabled) {
+  if (!feedbackEnabled || config.constantPidTestEnabled) {
     state->integralDegSec = 0.0f;
   } else if (!withinPositionTolerance) {
     if (fabsf(error) < fabsf(config.integralZoneDeg) &&
@@ -479,7 +521,12 @@ float Arm::updateJoint(Motor *motor, const JointConfig &config,
             fabsf(config.integralLimitDegSec));
   float integralOutput = config.kI * state->integralDegSec;
   float pidOutput = pOutput + dOutput + integralOutput;
-  if (config.constantPidTestEnabled) {
+  if (!feedbackEnabled) {
+    pOutput = 0.0f;
+    dOutput = 0.0f;
+    integralOutput = 0.0f;
+    pidOutput = 0.0f;
+  } else if (config.constantPidTestEnabled) {
     pidOutput =
         clamp(config.constantPidOutputPercent, -fabsf(config.maxPwmPercent),
               fabsf(config.maxPwmPercent));
@@ -503,7 +550,7 @@ float Arm::updateJoint(Motor *motor, const JointConfig &config,
       commandMoving ? directionSign(state->commandedVelocityDegPerSec)
                     : directionSign(error);
   float friction = 0.0f;
-  if (!config.constantPidTestEnabled &&
+  if (feedbackEnabled && !config.constantPidTestEnabled &&
       !withinPositionTolerance) {
     if (motionDirection > 0) {
       friction = fabsf(config.positiveStaticFrictionPercent);

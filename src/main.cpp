@@ -28,13 +28,14 @@ constexpr float kTapeCalibrationMaxTravelCm = 30.0f;
 constexpr uint32_t kTapeCalibrationTimeoutMs = 10000;
 constexpr float kTapeCalibrationMaxHeadingPower = 0.20f;
 constexpr float kTapeCalibrationMinHeadingPower = 0.00f;
-constexpr float kTapeCalibrationHeadingToleranceDeg = 0.5f;
-constexpr float kTapeCalibrationMinPeakRise = 50.0f;
+constexpr float kTapeCalibrationHeadingToleranceDeg = 1.0f;
+constexpr float kTapeCalibrationMinPeakRise = 100.0f;
 constexpr uint8_t kTapeCalibrationRiseConfirmSamples = 5;
 constexpr float kTapeCalibrationMinTravelPastPeakCm = 1.0f;
 constexpr uint8_t kTapeCalibrationPeakConfirmSamples = 10;
 constexpr float kTapeCalibrationProfileSpacingCm = 0.05f;
 constexpr uint16_t kTapeCalibrationMaxProfileSamples = 640;
+constexpr uint32_t kCalibrationSettleDelayMs = 250;
 constexpr float kMetalAnomalyThresholdHz = 90.0f;
 constexpr uint8_t kMetalDeviationAverageSamples = 5;
 // Adjust this signed value until the elbow just begins moving. Use a
@@ -110,6 +111,7 @@ Arm::Config makeArmConfig() {
   Arm::Config config;
   config.motorDisablePin = pins::EXTRA2_PIN;
   config.maxCartesianSpeedCmPerSec = 30.0f;
+  config.pidReenableDriftDeg = 2.5f;
   // Signed PWM percentages required to counter gravity when the corresponding
   // link is horizontal. Reverse a sign if compensation assists gravity.
   config.gravityA1Percent = 0.0f;
@@ -279,6 +281,13 @@ bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
   }
   if (driveTask.isBusy()) {
     Serial.println("Tape calibration failed: drive is already moving");
+    return false;
+  }
+
+  delay(kCalibrationSettleDelayMs);
+  if (!driveTask.getCurrentPose(&pose) || driveTask.isBusy()) {
+    Serial.println(
+        "Tape calibration failed: drive changed during settle delay");
     return false;
   }
   const OtosSensor::Pose startPose = pose;
@@ -641,10 +650,10 @@ bool calibrateYWithMiddleTapeSensor(float knownTapeYCm, float searchDirection,
 
 void stowGrabbedRock() {
   armTask.waitUntilSettled(1000);
-  armTask.setTargetPosition({10.0f, 7.0f}, true);
-  armTask.waitUntilSettled(1500);
-  armTask.setTargetPosition({8.480f, 1.093f}, true);
-  armTask.waitUntilSettled(1500);
+  armTask.setTargetPosition({8.0f, 10.0f}, true);
+  armTask.waitUntilSettled(3000);
+  armTask.setTargetPosition({8.5f, 1.1f}, true);
+  armTask.waitUntilSettled(1000);
   servo1.setAngle(clawOpenAngle);
   armTask.setTargetPosition({10.80f, 13.0f}, true);
   armTask.waitUntilSettled(1000);
@@ -782,8 +791,8 @@ void runPath() {
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({-65.0f, 9.0f, 134.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
+  driveTask.calibrateImuBlocking(750);
   if (!rockHeld) {
-    driveTask.calibrateImuBlocking(750);
     if (confirmedMetalDetected(metalDetectorLeft)) {
       servo1.setAngle(clawOpenAngle);
       delay(250);
@@ -822,25 +831,6 @@ void runPath() {
     Serial.println("Continuing with the existing OTOS Y position");
   }
   driveTask.setTargetPose({-144.0f, 94.0f, -90.0f}, 1.0f);
-  driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-127.0f, 94.0f, -90.0f}, 0.1f);
-  driveTask.waitUntilMotionFinished(3000);
-  servo1.setAngle(clawOpenAngle);
-  delay(250);
-  armTask.setTargetPosition({26.0, 4.0}, true);
-  armTask.waitUntilSettled(500);
-  servo1.setAngle(clawFullyClosedAngle);
-  delay(500);
-
-  // OtosSensor::Pose currPose;
-  // if (!driveTask.getCurrentPose(&currPose)) {
-  //   Serial.println("Current pose unavailable");
-  // }
-  // driveTask.setOtosPose({currPose.xCm, currPose.yCm, -90.0f});
-
-  armTask.setTargetPosition({24, 18}, true);
-  armTask.waitUntilSettled(1000);
-  driveTask.setTargetPose({-140.0f, 95.0f, -90.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({-140.0f, 140.0f, -90.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(10000);

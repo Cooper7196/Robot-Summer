@@ -55,6 +55,12 @@ public:
     uint32_t maxLoopDelayUs;
     bool latchFaults;
     int8_t motorDisablePin;
+    // Once both joints remain within tolerance and below this velocity for the
+    // settle time, disable feedback and retain gravity compensation only.
+    uint32_t gravityHoldSettleTimeMs;
+    float gravityHoldMaxVelocityDegPerSec;
+    // Re-enable PID if either joint moves this far from its settled angle.
+    float pidReenableDriftDeg;
     // Signed PWM percentages: A1*cos(q1) + A12*cos(q1+q2), A2*cos(q1+q2).
     float gravityA1Percent;
     float gravityA12Percent;
@@ -85,6 +91,7 @@ public:
   struct Telemetry {
     JointTelemetry shoulder;
     JointTelemetry elbow;
+    bool gravityHoldActive;
     bool faulted;
     uint32_t timestampUs;
   };
@@ -150,7 +157,8 @@ private:
   void enterFault();
   float updateJoint(Motor *motor, const JointConfig &config, JointState *state,
                     float commandedPositionDeg, float positionDeg, float dtSec,
-                    float gravityPercent, JointTelemetry *telemetry);
+                    float gravityPercent, bool feedbackEnabled,
+                    JointTelemetry *telemetry);
 
   Motor *shoulderMotor_;
   Motor *elbowMotor_;
@@ -170,5 +178,8 @@ private:
   bool cartesianPathComplete_;
   bool elbowUp_;
   bool atTarget_;
+  bool gravityHoldActive_;
+  uint32_t gravityHoldSettledSinceUs_;
+  JointAngles gravityHoldAngles_;
   bool faulted_;
 };
