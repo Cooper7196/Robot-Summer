@@ -17,11 +17,22 @@ public:
              UBaseType_t priority = 1);
   bool setTargetPose(const OtosSensor::Pose &targetPose,
                      float maxPower = 1.0f,
-                     bool intermediaryPosition = false);
+                     bool intermediaryPosition = false,
+                     float maxHeadingPower = -1.0f,
+                     float minHeadingPower = 0.0f,
+                     float headingToleranceDeg = -1.0f);
+  // Applies to subsequent updates of the current motion as well as future
+  // motions. Position is in centimetres and heading is in degrees.
+  bool setMotionTolerance(float positionToleranceCm,
+                          float headingToleranceDeg);
   bool setOtosPose(const OtosSensor::Pose &currentPose);
   // Backward-compatible alias for setOtosPose().
   bool setCurrentPose(const OtosSensor::Pose &currentPose);
   bool getCurrentPose(OtosSensor::Pose *currentPose) const;
+  // Stops the drivetrain, starts OTOS gyro calibration, and blocks the caller
+  // until the sample collection closest to durationMs has elapsed. Call this
+  // only while the robot is stationary between route movements.
+  bool calibrateImuBlocking(uint32_t durationMs);
   bool isBusy() const;
   bool atTarget() const;
   // Blocks until the current motion finishes or timeoutMs elapses.
@@ -29,13 +40,25 @@ public:
   void cancel();
 
 private:
-  enum class CommandType : uint8_t { TargetPose, SetCurrentPose, Cancel };
+  enum class CommandType : uint8_t {
+    TargetPose,
+    SetCurrentPose,
+    SetMotionTolerance,
+    CalibrateImu,
+    Cancel
+  };
 
   struct Command {
     CommandType type;
     OtosSensor::Pose pose;
     float maxPower;
     bool intermediaryPosition;
+    float maxHeadingPower;
+    float minHeadingPower;
+    float targetHeadingToleranceDeg;
+    float positionToleranceCm;
+    float headingToleranceDeg;
+    uint32_t gyroCalibrationSamples;
   };
 
   static void taskEntry(void *context);
@@ -53,6 +76,8 @@ private:
   bool poseValid_;
   bool busy_;
   bool atTarget_;
+  bool calibrationInProgress_;
+  bool calibrationSucceeded_;
 };
 
 class ArmTask {

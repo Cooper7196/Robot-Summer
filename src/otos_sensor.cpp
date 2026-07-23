@@ -81,6 +81,37 @@ bool OtosSensor::getPose(Pose *pose, uint32_t timeoutMs) {
   return readLastPose(pose);
 }
 
+bool OtosSensor::startGyroCalibration(uint32_t sampleCount,
+                                      uint32_t timeoutMs) {
+  if (sampleCount == 0) {
+    setLocalError(ErrorCode::BusyOrOverflow);
+    return false;
+  }
+
+  const uint8_t payload[4] = {
+      static_cast<uint8_t>(sampleCount),
+      static_cast<uint8_t>(sampleCount >> 8),
+      static_cast<uint8_t>(sampleCount >> 16),
+      static_cast<uint8_t>(sampleCount >> 24),
+  };
+
+  if (!sendCommand(Command::CalibrateGyro, payload, sizeof(payload)) ||
+      !waitForPacket(Command::CalibrateGyroReply, timeoutMs)) {
+    return false;
+  }
+
+  if (payloadLength_ != 0) {
+    setLocalError(ErrorCode::BadLength);
+    return false;
+  }
+
+  return true;
+}
+
+float OtosSensor::gyroCalibrationDurationSeconds(uint32_t sampleCount) {
+  return static_cast<float>(sampleCount) / 480.0f;
+}
+
 bool OtosSensor::setPose(const Pose &pose, uint32_t timeoutMs) {
   const Pose sensorPose = robotPoseToSensorPose(pose);
   uint8_t payload[12] = {};

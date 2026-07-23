@@ -9,9 +9,13 @@ MecanumDrive::MecanumDrive(Motor &frontLeft, Motor &frontRight, Motor &backLeft,
       headingIntegral_(0.0f), lastXError_(0.0f), lastYError_(0.0f),
       lastHeadingError_(0.0f), lastPose_(), hasLastPose_(false),
       pathStartPose_(), hasPathStartPose_(false), targetPose_(),
-      targetMaxPower_(1.0f), targetIsIntermediary_(false),
-      hasPoseTarget_(false), atPoseTarget_(false), outputsStopped_(true),
-      lastDisabledStopMs_(0) {}
+      targetMaxPower_(1.0f), targetMaxHeadingPower_(1.0f),
+      targetMinHeadingPower_(0.0f),
+      targetHeadingToleranceDeg_(POSE_HEADING_TOLERANCE_DEG),
+      positionToleranceCm_(POSE_POSITION_TOLERANCE_CM),
+      headingToleranceDeg_(POSE_HEADING_TOLERANCE_DEG),
+      targetIsIntermediary_(false), hasPoseTarget_(false),
+      atPoseTarget_(false), outputsStopped_(true), lastDisabledStopMs_(0) {}
 
 void MecanumDrive::begin() {
   if (enablePin_ != NO_ENABLE_PIN) {
@@ -40,9 +44,19 @@ void MecanumDrive::drive(float xVelocity, float yVelocity, float omega) {
 
 void MecanumDrive::setTargetPose(const OtosSensor::Pose &targetPose,
                                  float maxPower,
-                                 bool intermediaryPosition) {
+                                 bool intermediaryPosition,
+                                 float maxHeadingPower,
+                                 float minHeadingPower,
+                                 float headingToleranceDeg) {
   targetPose_ = targetPose;
   targetMaxPower_ = clamp(maxPower, 0.0f, 1.0f);
+  targetMaxHeadingPower_ =
+      maxHeadingPower > 0.0f ? clamp(maxHeadingPower, 0.0f, 1.0f)
+                             : targetMaxPower_;
+  targetMinHeadingPower_ =
+      clamp(minHeadingPower, 0.0f, targetMaxHeadingPower_);
+  targetHeadingToleranceDeg_ =
+      headingToleranceDeg > 0.0f ? headingToleranceDeg : headingToleranceDeg_;
   targetIsIntermediary_ = intermediaryPosition;
   hasPoseTarget_ = true;
   atPoseTarget_ = false;
@@ -82,7 +96,8 @@ bool MecanumDrive::updatePoseTarget(const OtosSensor::Pose &currentPose) {
   }
 
   if (updateDriveToPose(currentPose, targetPose_, targetMaxPower_,
-                        targetIsIntermediary_)) {
+                        targetIsIntermediary_, targetMaxHeadingPower_,
+                        targetMinHeadingPower_, targetHeadingToleranceDeg_)) {
     hasPoseTarget_ = false;
     atPoseTarget_ = true;
   }
@@ -98,6 +113,17 @@ void MecanumDrive::cancelPoseTarget() {
   atPoseTarget_ = false;
   stop();
   resetPosePid();
+}
+
+bool MecanumDrive::setMotionTolerance(float positionToleranceCm,
+                                      float headingToleranceDeg) {
+  if (positionToleranceCm <= 0.0f || headingToleranceDeg <= 0.0f) {
+    return false;
+  }
+
+  positionToleranceCm_ = positionToleranceCm;
+  headingToleranceDeg_ = headingToleranceDeg;
+  return true;
 }
 
 bool MecanumDrive::driveToPose(OtosSensor &otosSensor,
@@ -130,7 +156,8 @@ bool MecanumDrive::driveToPose(OtosSensor &otosSensor,
                   xError, yError, headingError);
 
     if (updateDriveToPose(currentPose, targetPose, maxPower,
-                          intermediaryPosition)) {
+                          intermediaryPosition, maxPower, 0.0f,
+                          headingToleranceDeg_)) {
       return true;
     }
 
@@ -140,8 +167,11 @@ bool MecanumDrive::driveToPose(OtosSensor &otosSensor,
 
 bool MecanumDrive::updateDriveToPose(const OtosSensor::Pose &currentPose,
                                      const OtosSensor::Pose &targetPose,
-                                     const float maxPower,
-                                     bool intermediaryPosition) {
+                                     float maxPower,
+                                     bool intermediaryPosition,
+                                     float maxHeadingPower,
+                                     float minHeadingPower,
+                                     float headingToleranceDeg) {
   const uint32_t nowMs = millis();
   const float dtSec =
       lastPosePidMs_ != 0 ? (nowMs - lastPosePidMs_) / 1000.0f : 0.0f;
@@ -172,11 +202,15 @@ bool MecanumDrive::updateDriveToPose(const OtosSensor::Pose &currentPose,
   lastPose_ = currentPose;
   hasLastPose_ = true;
 
+  const float effectivePositionToleranceCm =
+      intermediaryPosition
+          ? positionToleranceCm_ *
+                POSE_INTERMEDIARY_POSITION_TOLERANCE_MULTIPLIER
+          : positionToleranceCm_;
   const bool insideTranslation =
-      fabsf(xError) < POSE_POSITION_TOLERANCE_CM &&
-      fabsf(yError) < POSE_POSITION_TOLERANCE_CM;
-  const bool insideHeading =
-      fabsf(headingError) < POSE_HEADING_TOLERANCE_DEG;
+      fabsf(xError) < effectivePositionToleranceCm &&
+      fabsf(yError) < effectivePositionToleranceCm;
+  const bool insideHeading = fabsf(headingError) < headingToleranceDeg;
   const bool insidePosition = insideTranslation && insideHeading;
   const bool underVelocity =
       hasVelocityEstimate &&
@@ -271,13 +305,18 @@ bool MecanumDrive::updateDriveToPose(const OtosSensor::Pose &currentPose,
                        (POSE_HEADING_KI * headingIntegral_) +
                        (POSE_HEADING_KD * headingDerivative);
 
-  omegaCommand = clamp(omegaCommand, -maxPower, maxPower);
+  omegaCommand =
+      clamp(omegaCommand, -maxHeadingPower, maxHeadingPower);
+  float effectiveMinHeadingPower = minHeadingPower;
   if (intermediaryPosition && !insideHeading) {
-    const float minimumHeadingPower =
-        fminf(POSE_INTERMEDIARY_MIN_HEADING_POWER, maxPower);
-    if (fabsf(omegaCommand) < minimumHeadingPower) {
-      omegaCommand = minimumHeadingPower * signum(headingError);
-    }
+    effectiveMinHeadingPower =
+        fmaxf(effectiveMinHeadingPower,
+              fminf(POSE_INTERMEDIARY_MIN_HEADING_POWER, maxHeadingPower));
+  }
+  effectiveMinHeadingPower =
+      fminf(effectiveMinHeadingPower, maxHeadingPower);
+  if (!insideHeading && fabsf(omegaCommand) < effectiveMinHeadingPower) {
+    omegaCommand = effectiveMinHeadingPower * signum(headingError);
   }
 
   const float headingRad = currentPose.headingDeg * DEG_TO_RAD;

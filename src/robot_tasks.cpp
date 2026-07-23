@@ -9,7 +9,8 @@ constexpr uint32_t kPoseLogPeriodMs = 100;
 DriveTask::DriveTask(MecanumDrive &drive, OtosSensor &otos)
     : drive_(&drive), otos_(&otos), pwmMutex_(nullptr), stateMutex_(nullptr),
       commandQueue_(nullptr), taskHandle_(nullptr), currentPose_(),
-      poseValid_(false), busy_(false), atTarget_(false) {}
+      poseValid_(false), busy_(false), atTarget_(false),
+      calibrationInProgress_(false), calibrationSucceeded_(false) {}
 
 bool DriveTask::begin(SemaphoreHandle_t pwmMutex, uint32_t stackSize,
                       UBaseType_t priority) {
@@ -29,13 +30,16 @@ bool DriveTask::begin(SemaphoreHandle_t pwmMutex, uint32_t stackSize,
 }
 
 bool DriveTask::setTargetPose(const OtosSensor::Pose &targetPose,
-                              float maxPower, bool intermediaryPosition) {
+                              float maxPower, bool intermediaryPosition,
+                              float maxHeadingPower, float minHeadingPower,
+                              float headingToleranceDeg) {
   if (commandQueue_ == nullptr) {
     return false;
   }
 
   Command command{CommandType::TargetPose, targetPose, maxPower,
-                  intermediaryPosition};
+                  intermediaryPosition, maxHeadingPower, minHeadingPower,
+                  headingToleranceDeg, 0.0f, 0.0f, 0};
   const bool queued = xQueueSendToBack(commandQueue_, &command, 0) == pdPASS;
   if (queued) {
     updateStatus(true, false);
@@ -43,11 +47,25 @@ bool DriveTask::setTargetPose(const OtosSensor::Pose &targetPose,
   return queued;
 }
 
+bool DriveTask::setMotionTolerance(float positionToleranceCm,
+                                   float headingToleranceDeg) {
+  if (commandQueue_ == nullptr || positionToleranceCm <= 0.0f ||
+      headingToleranceDeg <= 0.0f) {
+    return false;
+  }
+
+  Command command{CommandType::SetMotionTolerance, OtosSensor::Pose(), 0.0f,
+                  false, -1.0f, 0.0f, -1.0f, positionToleranceCm,
+                  headingToleranceDeg, 0};
+  return xQueueSendToBack(commandQueue_, &command, 0) == pdPASS;
+}
+
 bool DriveTask::setOtosPose(const OtosSensor::Pose &currentPose) {
   if (commandQueue_ == nullptr) {
     return false;
   }
-  Command command{CommandType::SetCurrentPose, currentPose, 0.0f, false};
+  Command command{CommandType::SetCurrentPose, currentPose, 0.0f, false, -1.0f,
+                  0.0f, -1.0f, 0.0f, 0.0f, 0};
   return xQueueSendToBack(commandQueue_, &command, 0) == pdPASS;
 }
 
@@ -66,6 +84,48 @@ bool DriveTask::getCurrentPose(OtosSensor::Pose *currentPose) const {
   }
   xSemaphoreGive(stateMutex_);
   return valid;
+}
+
+bool DriveTask::calibrateImuBlocking(uint32_t durationMs) {
+  if (commandQueue_ == nullptr || stateMutex_ == nullptr || durationMs == 0 ||
+      isBusy()) {
+    return false;
+  }
+
+  uint32_t sampleCount = static_cast<uint32_t>(
+      (static_cast<uint64_t>(durationMs) * 480U + 500U) / 1000U);
+  if (sampleCount == 0) {
+    sampleCount = 1;
+  }
+
+  xSemaphoreTake(stateMutex_, portMAX_DELAY);
+  if (calibrationInProgress_) {
+    xSemaphoreGive(stateMutex_);
+    return false;
+  }
+  calibrationInProgress_ = true;
+  calibrationSucceeded_ = false;
+  xSemaphoreGive(stateMutex_);
+
+  Command command{CommandType::CalibrateImu, OtosSensor::Pose(), 0.0f, false,
+                  -1.0f, 0.0f, -1.0f, 0.0f, 0.0f, sampleCount};
+  if (xQueueSendToBack(commandQueue_, &command, 0) != pdPASS) {
+    xSemaphoreTake(stateMutex_, portMAX_DELAY);
+    calibrationInProgress_ = false;
+    xSemaphoreGive(stateMutex_);
+    return false;
+  }
+
+  for (;;) {
+    xSemaphoreTake(stateMutex_, portMAX_DELAY);
+    const bool inProgress = calibrationInProgress_;
+    const bool succeeded = calibrationSucceeded_;
+    xSemaphoreGive(stateMutex_);
+    if (!inProgress) {
+      return succeeded;
+    }
+    vTaskDelay(1);
+  }
 }
 
 bool DriveTask::isBusy() const {
@@ -103,7 +163,8 @@ void DriveTask::cancel() {
   if (commandQueue_ == nullptr) {
     return;
   }
-  Command command{CommandType::Cancel, OtosSensor::Pose(), 0.0f, false};
+  Command command{CommandType::Cancel, OtosSensor::Pose(), 0.0f, false, -1.0f,
+                  0.0f, -1.0f, 0.0f, 0.0f, 0};
   xQueueReset(commandQueue_);
   xQueueSendToBack(commandQueue_, &command, 0);
   updateStatus(false, false);
@@ -128,7 +189,10 @@ void DriveTask::run() {
     if (xQueueReceive(commandQueue_, &command, 0) == pdTRUE) {
       if (command.type == CommandType::TargetPose) {
         drive_->setTargetPose(command.pose, command.maxPower,
-                              command.intermediaryPosition);
+                              command.intermediaryPosition,
+                              command.maxHeadingPower,
+                              command.minHeadingPower,
+                              command.targetHeadingToleranceDeg);
         updateStatus(true, false);
       } else if (command.type == CommandType::SetCurrentPose) {
         const bool set = otos_->setPose(command.pose);
@@ -136,6 +200,31 @@ void DriveTask::run() {
           updateSnapshot(command.pose, true);
           drive_->resetPosePid();
         }
+      } else if (command.type == CommandType::SetMotionTolerance) {
+        drive_->setMotionTolerance(command.positionToleranceCm,
+                                   command.headingToleranceDeg);
+      } else if (command.type == CommandType::CalibrateImu) {
+        xSemaphoreTake(pwmMutex_, portMAX_DELAY);
+        drive_->cancelPoseTarget();
+        drive_->stop();
+        drive_->resetPosePid();
+        xSemaphoreGive(pwmMutex_);
+        updateStatus(false, false);
+
+        const bool started =
+            otos_->startGyroCalibration(command.gyroCalibrationSamples);
+        if (started) {
+          const uint64_t durationMs =
+              (static_cast<uint64_t>(command.gyroCalibrationSamples) * 1000U +
+               479U) /
+              480U;
+          vTaskDelay(pdMS_TO_TICKS(durationMs));
+        }
+
+        xSemaphoreTake(stateMutex_, portMAX_DELAY);
+        calibrationSucceeded_ = started;
+        calibrationInProgress_ = false;
+        xSemaphoreGive(stateMutex_);
       } else {
         xSemaphoreTake(pwmMutex_, portMAX_DELAY);
         drive_->cancelPoseTarget();

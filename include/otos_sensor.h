@@ -9,10 +9,12 @@ public:
     None = 0x00,
     Ping = 0x01,
     GetPosition = 0x03,
+    CalibrateGyro = 0x04,
     SetPose = 0x05,
     Error = 0x7F,
     Pong = 0x81,
     PositionReply = 0x83,
+    CalibrateGyroReply = 0x84,
     SetPoseReply = 0x85,
   };
 
@@ -50,6 +52,12 @@ public:
 
   bool ping(uint32_t timeoutMs = DEFAULT_TIMEOUT_MS);
   bool getPose(Pose *pose, uint32_t timeoutMs = DEFAULT_TIMEOUT_MS);
+  // Starts sample collection and waits only for the start acknowledgment.
+  // Keep the sensor stationary for approximately
+  // gyroCalibrationDurationSeconds(sampleCount) after this returns true.
+  bool startGyroCalibration(uint32_t sampleCount,
+                            uint32_t timeoutMs = DEFAULT_TIMEOUT_MS);
+  static float gyroCalibrationDurationSeconds(uint32_t sampleCount);
   bool setPose(const Pose &pose, uint32_t timeoutMs = DEFAULT_TIMEOUT_MS);
 
   ErrorCode remoteError() const;

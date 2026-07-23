@@ -15,8 +15,28 @@ constexpr uint32_t kSerialBaud = 115200;
 const OtosSensor::Pose kTargetPose(0.0f, 100.0f, 0.0f);
 constexpr float kTapeAdcReferenceVolts = 3.3f;
 constexpr float kTapeThresholdVolts = 1.1f;
-constexpr float kMetalAnomalyThresholdHz = 60.0f;
-constexpr uint8_t kMetalDeviationAverageSamples = 4;
+constexpr uint8_t kTapeCalibrationSensorCount = 3;
+constexpr uint8_t kTapeCalibrationSensorChannels[kTapeCalibrationSensorCount] =
+    {2, 4, 6};
+// Installed sensors are two array positions apart. Channel 6 is on robot -X
+// (left) and channel 2 is on robot +X (right).
+constexpr float kTapeCalibrationSensorLocalXCm[kTapeCalibrationSensorCount] = {
+    2.4f, 0.0f, -2.4f};
+constexpr float kTapeCalibrationSensorLocalYCm = 11.33f;
+constexpr uint8_t kMiddleTapeSensorChannel = 4;
+constexpr float kTapeCalibrationMaxTravelCm = 30.0f;
+constexpr uint32_t kTapeCalibrationTimeoutMs = 10000;
+constexpr float kTapeCalibrationMaxHeadingPower = 0.20f;
+constexpr float kTapeCalibrationMinHeadingPower = 0.00f;
+constexpr float kTapeCalibrationHeadingToleranceDeg = 0.5f;
+constexpr float kTapeCalibrationMinPeakRise = 50.0f;
+constexpr uint8_t kTapeCalibrationRiseConfirmSamples = 5;
+constexpr float kTapeCalibrationMinTravelPastPeakCm = 1.0f;
+constexpr uint8_t kTapeCalibrationPeakConfirmSamples = 10;
+constexpr float kTapeCalibrationProfileSpacingCm = 0.05f;
+constexpr uint16_t kTapeCalibrationMaxProfileSamples = 640;
+constexpr float kMetalAnomalyThresholdHz = 90.0f;
+constexpr uint8_t kMetalDeviationAverageSamples = 5;
 // Adjust this signed value until the elbow just begins moving. Use a
 // negative value to measure friction in the opposite direction.
 constexpr bool kElbowConstantPidTestEnabled = false;
@@ -33,9 +53,10 @@ constexpr float kShoulderMinAngleDeg = -180.0f;
 constexpr float kShoulderMaxAngleDeg = 180.0f;
 constexpr float kElbowMinAngleDeg = -180.0f;
 constexpr float kElbowMaxAngleDeg = 180.0f;
-constexpr float clawOpenAngle = 50.0f;
-constexpr float clawClosedAngle = 130.0f;
-constexpr float clawFullyClosedAngle = 180.0f;
+constexpr float clawOpenAngle = 40.0f;
+constexpr float clawHabitatOpenAngle = 115.0f;
+constexpr float clawClosedAngle = 115.0f;
+constexpr float clawFullyClosedAngle = 142.0f;
 
 uint16_t adcCountFromVolts(float volts) {
   if (volts <= 0.0f) {
@@ -67,9 +88,9 @@ AngleServo servo1(pins::SERVO1_PWM_PIN);
 OtosSensor otosSensor(Serial1);
 TapeSensorArray tapeSensors;
 MetalDetector::Config metalDetectorConfig = makeMetalDetectorConfig();
-MetalDetector metalDetectorLeft(pins::MD_LEFT_PIN, PCNT_UNIT_0,
+MetalDetector metalDetectorLeft(pins::MD_RIGHT_PIN, PCNT_UNIT_0,
                                 metalDetectorConfig);
-MetalDetector metalDetectorRight(pins::MD_RIGHT_PIN, PCNT_UNIT_1,
+MetalDetector metalDetectorRight(pins::MD_LEFT_PIN, PCNT_UNIT_1,
                                  metalDetectorConfig);
 
 bool confirmedMetalDetected(const MetalDetector &detector) {
@@ -211,6 +232,413 @@ void delayWithArmLogging(uint32_t durationMs) {
   }
 }
 
+bool waitForDrivePose(const OtosSensor::Pose &expectedPose,
+                      uint32_t timeoutMs = 500) {
+  const uint32_t startMs = millis();
+  while (millis() - startMs < timeoutMs) {
+    OtosSensor::Pose currentPose;
+    if (driveTask.getCurrentPose(&currentPose)) {
+      float headingError = currentPose.headingDeg - expectedPose.headingDeg;
+      while (headingError > 180.0f) {
+        headingError -= 360.0f;
+      }
+      while (headingError < -180.0f) {
+        headingError += 360.0f;
+      }
+
+      if (fabsf(currentPose.xCm - expectedPose.xCm) <= 0.15f &&
+          fabsf(currentPose.yCm - expectedPose.yCm) <= 0.15f &&
+          fabsf(headingError) <= 0.5f) {
+        return true;
+      }
+    }
+    delay(1);
+  }
+  return false;
+}
+
+enum class TapeCalibrationAxis : uint8_t { X, Y };
+
+bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
+                                   float knownTapeCoordinateCm,
+                                   float searchDirection, float searchPower) {
+  if (searchDirection == 0.0f) {
+    Serial.println("Tape calibration failed: search direction is zero");
+    return false;
+  }
+  if (searchPower <= 0.0f || searchPower > 1.0f) {
+    Serial.println("Tape calibration failed: search power must be (0, 1]");
+    return false;
+  }
+  searchDirection = searchDirection < 0.0f ? -1.0f : 1.0f;
+
+  OtosSensor::Pose pose;
+  if (!driveTask.getCurrentPose(&pose)) {
+    Serial.println("Tape calibration failed: pose unavailable");
+    return false;
+  }
+  if (driveTask.isBusy()) {
+    Serial.println("Tape calibration failed: drive is already moving");
+    return false;
+  }
+  const OtosSensor::Pose startPose = pose;
+  const float startCrossTrackCm =
+      axis == TapeCalibrationAxis::X ? startPose.yCm : startPose.xCm;
+
+  uint16_t readings[TapeSensorArray::CHANNEL_COUNT];
+  float sampleReadings[kTapeCalibrationSensorCount][5] = {};
+  float samplePoseCoordinateCm[5] = {};
+  OtosSensor::Pose samplePoses[5] = {};
+  uint8_t sampleCount = 0;
+  float centeredReading = 0.0f;
+  float baselineReading = 0.0f;
+  float peakReading = 0.0f;
+  float peakPoseCoordinateCm = 0.0f;
+  static float profileReadings[kTapeCalibrationSensorCount]
+                              [kTapeCalibrationMaxProfileSamples];
+  static float profileCoordinatesCm[kTapeCalibrationMaxProfileSamples];
+  uint16_t profileCount = 0;
+  uint16_t peakProfileIndex = 0;
+  bool baselineValid = false;
+  bool significantRiseDetected = false;
+  bool peakPoseValid = false;
+  bool peakConfirmed = false;
+  bool profileOverflow = false;
+  float maxCrossTrackDriftCm = 0.0f;
+  float maxHeadingDriftDeg = 0.0f;
+  uint8_t riseCount = 0;
+  uint8_t peakDropCount = 0;
+
+  // Drive in the requested world-axis direction beyond the expected tape
+  // position so a local maximum can be distinguished from noise.
+  OtosSensor::Pose searchTarget = pose;
+  if (axis == TapeCalibrationAxis::X) {
+    searchTarget.xCm += searchDirection * kTapeCalibrationMaxTravelCm;
+  } else {
+    searchTarget.yCm += searchDirection * kTapeCalibrationMaxTravelCm;
+  }
+  if (!driveTask.setTargetPose(searchTarget, searchPower, false,
+                               kTapeCalibrationMaxHeadingPower,
+                               kTapeCalibrationMinHeadingPower,
+                               kTapeCalibrationHeadingToleranceDeg)) {
+    Serial.println("Tape calibration failed: search command not queued");
+    return false;
+  }
+
+  uint32_t searchStartMs = millis();
+  while (millis() - searchStartMs < kTapeCalibrationTimeoutMs) {
+    tapeSensors.readAll(readings);
+    OtosSensor::Pose samplePose;
+    if (!driveTask.getCurrentPose(&samplePose)) {
+      delay(1);
+      continue;
+    }
+
+    if (sampleCount < 5) {
+      for (uint8_t sensor = 0; sensor < kTapeCalibrationSensorCount; ++sensor) {
+        sampleReadings[sensor][sampleCount] =
+            readings[kTapeCalibrationSensorChannels[sensor]];
+      }
+      samplePoseCoordinateCm[sampleCount] =
+          axis == TapeCalibrationAxis::X ? samplePose.xCm : samplePose.yCm;
+      samplePoses[sampleCount] = samplePose;
+      ++sampleCount;
+    } else {
+      for (uint8_t i = 0; i < 4; ++i) {
+        for (uint8_t sensor = 0; sensor < kTapeCalibrationSensorCount;
+             ++sensor) {
+          sampleReadings[sensor][i] = sampleReadings[sensor][i + 1];
+        }
+        samplePoseCoordinateCm[i] = samplePoseCoordinateCm[i + 1];
+        samplePoses[i] = samplePoses[i + 1];
+      }
+      for (uint8_t sensor = 0; sensor < kTapeCalibrationSensorCount; ++sensor) {
+        sampleReadings[sensor][4] =
+            readings[kTapeCalibrationSensorChannels[sensor]];
+      }
+      samplePoseCoordinateCm[4] =
+          axis == TapeCalibrationAxis::X ? samplePose.xCm : samplePose.yCm;
+      samplePoses[4] = samplePose;
+    }
+
+    if (sampleCount < 5) {
+      delay(1);
+      continue;
+    }
+
+    // A centered median rejects short ADC spikes without shifting the detected
+    // peak in the direction of travel. Its position is the middle sample.
+    float centeredReadings[kTapeCalibrationSensorCount];
+    for (uint8_t sensor = 0; sensor < kTapeCalibrationSensorCount; ++sensor) {
+      float sortedReadings[5];
+      for (uint8_t i = 0; i < 5; ++i) {
+        sortedReadings[i] = sampleReadings[sensor][i];
+      }
+      for (uint8_t i = 1; i < 5; ++i) {
+        const float value = sortedReadings[i];
+        uint8_t position = i;
+        while (position > 0 && sortedReadings[position - 1] > value) {
+          sortedReadings[position] = sortedReadings[position - 1];
+          --position;
+        }
+        sortedReadings[position] = value;
+      }
+      centeredReadings[sensor] = sortedReadings[2];
+    }
+    centeredReading = centeredReadings[1];
+
+    const OtosSensor::Pose &centeredPose = samplePoses[2];
+    const float centeredCoordinateCm = samplePoseCoordinateCm[2];
+    const float centeredCrossTrackCm =
+        axis == TapeCalibrationAxis::X ? centeredPose.yCm : centeredPose.xCm;
+    float headingDriftDeg = centeredPose.headingDeg - startPose.headingDeg;
+    while (headingDriftDeg > 180.0f) {
+      headingDriftDeg -= 360.0f;
+    }
+    while (headingDriftDeg < -180.0f) {
+      headingDriftDeg += 360.0f;
+    }
+    maxCrossTrackDriftCm = fmaxf(
+        maxCrossTrackDriftCm, fabsf(centeredCrossTrackCm - startCrossTrackCm));
+    maxHeadingDriftDeg = fmaxf(maxHeadingDriftDeg, fabsf(headingDriftDeg));
+
+    // Process samples at fixed spatial intervals so detection does not depend
+    // on loop rate, OTOS update rate, or small changes in crossing speed.
+    if (profileCount > 0 &&
+        (centeredCoordinateCm - profileCoordinatesCm[profileCount - 1]) *
+                searchDirection <
+            kTapeCalibrationProfileSpacingCm) {
+      if (!driveTask.isBusy()) {
+        break;
+      }
+      delay(1);
+      continue;
+    }
+    if (profileCount >= kTapeCalibrationMaxProfileSamples) {
+      profileOverflow = true;
+      break;
+    }
+    for (uint8_t sensor = 0; sensor < kTapeCalibrationSensorCount; ++sensor) {
+      profileReadings[sensor][profileCount] = centeredReadings[sensor];
+    }
+    profileCoordinatesCm[profileCount] = centeredCoordinateCm;
+    const uint16_t currentProfileIndex = profileCount++;
+
+    if (!significantRiseDetected) {
+      if (!baselineValid) {
+        baselineReading = centeredReading;
+        baselineValid = true;
+      } else {
+        // Until the tape is encountered, retain the lowest stable background
+        // value. The five-sample median prevents a single low ADC spike from
+        // artificially lowering this reference.
+        baselineReading = fminf(baselineReading, centeredReading);
+      }
+
+      if (centeredReading - baselineReading >= kTapeCalibrationMinPeakRise) {
+        if (riseCount < kTapeCalibrationRiseConfirmSamples) {
+          ++riseCount;
+        }
+      } else {
+        riseCount = 0;
+      }
+
+      if (riseCount >= kTapeCalibrationRiseConfirmSamples) {
+        significantRiseDetected = true;
+        peakReading = centeredReading;
+        peakPoseCoordinateCm = centeredCoordinateCm;
+        peakProfileIndex = currentProfileIndex;
+        peakPoseValid = true;
+        peakDropCount = 0;
+        Serial.printf("Tape rise detected: baseline=%.1f reading=%.1f\n",
+                      baselineReading, centeredReading);
+      }
+    } else {
+      if (centeredReading > peakReading) {
+        peakReading = centeredReading;
+        peakPoseCoordinateCm = centeredCoordinateCm;
+        peakProfileIndex = currentProfileIndex;
+        peakPoseValid = true;
+        peakDropCount = 0;
+      }
+    }
+
+    if (peakPoseValid) {
+      const float travelPastPeakCm =
+          (centeredCoordinateCm - peakPoseCoordinateCm) * searchDirection;
+      const bool sufficientlyPastPeak =
+          travelPastPeakCm >= kTapeCalibrationMinTravelPastPeakCm;
+      const float currentHalfHeight =
+          baselineReading + (0.5f * (peakReading - baselineReading));
+      const bool readingBelowHalfHeight = centeredReading <= currentHalfHeight;
+
+      if (sufficientlyPastPeak && readingBelowHalfHeight) {
+        if (peakDropCount < kTapeCalibrationPeakConfirmSamples) {
+          ++peakDropCount;
+        }
+      } else {
+        peakDropCount = 0;
+      }
+
+      if (peakDropCount >= kTapeCalibrationPeakConfirmSamples) {
+        peakConfirmed = true;
+        break;
+      }
+    }
+
+    if (!driveTask.isBusy()) {
+      break;
+    }
+    delay(1);
+  }
+
+  driveTask.cancel();
+  delay(50);
+  if (profileOverflow) {
+    Serial.println("Tape calibration warning: profile buffer full");
+  }
+  if (profileCount < 3) {
+    Serial.println("Tape calibration failed: insufficient profile samples");
+    return false;
+  }
+
+  const float headingRad = startPose.headingDeg * DEG_TO_RAD;
+  float measuredTapeCenterSumCm = 0.0f;
+  uint8_t validSensorCount = 0;
+
+  for (uint8_t sensor = 0; sensor < kTapeCalibrationSensorCount; ++sensor) {
+    float sensorBaseline = profileReadings[sensor][0];
+    float sensorPeak = profileReadings[sensor][0];
+    uint16_t sensorPeakIndex = 0;
+    for (uint16_t i = 1; i < profileCount; ++i) {
+      sensorBaseline = fminf(sensorBaseline, profileReadings[sensor][i]);
+      if (profileReadings[sensor][i] > sensorPeak) {
+        sensorPeak = profileReadings[sensor][i];
+        sensorPeakIndex = i;
+      }
+    }
+
+    if (sensorPeak - sensorBaseline < kTapeCalibrationMinPeakRise) {
+      Serial.printf("Tape ch%u ignored: rise %.1f is too small\n",
+                    kTapeCalibrationSensorChannels[sensor],
+                    sensorPeak - sensorBaseline);
+      continue;
+    }
+
+    const float edgeReading =
+        sensorBaseline + (0.5f * (sensorPeak - sensorBaseline));
+    float risingEdgeCoordinateCm = 0.0f;
+    float fallingEdgeCoordinateCm = 0.0f;
+    bool risingEdgeValid = false;
+    bool fallingEdgeValid = false;
+
+    // Keep the last upward half-height crossing before the peak.
+    for (uint16_t i = 1; i <= sensorPeakIndex; ++i) {
+      const float previousReading = profileReadings[sensor][i - 1];
+      const float currentReading = profileReadings[sensor][i];
+      if (previousReading < edgeReading && currentReading >= edgeReading) {
+        const float fraction = (edgeReading - previousReading) /
+                               (currentReading - previousReading);
+        risingEdgeCoordinateCm =
+            profileCoordinatesCm[i - 1] +
+            fraction * (profileCoordinatesCm[i] - profileCoordinatesCm[i - 1]);
+        risingEdgeValid = true;
+      }
+    }
+
+    // Use the first downward half-height crossing after the peak.
+    for (uint16_t i = sensorPeakIndex + 1; i < profileCount; ++i) {
+      const float previousReading = profileReadings[sensor][i - 1];
+      const float currentReading = profileReadings[sensor][i];
+      if (previousReading >= edgeReading && currentReading < edgeReading) {
+        const float fraction = (edgeReading - previousReading) /
+                               (currentReading - previousReading);
+        fallingEdgeCoordinateCm =
+            profileCoordinatesCm[i - 1] +
+            fraction * (profileCoordinatesCm[i] - profileCoordinatesCm[i - 1]);
+        fallingEdgeValid = true;
+        break;
+      }
+    }
+
+    if (!risingEdgeValid || !fallingEdgeValid) {
+      Serial.printf("Tape ch%u ignored: half-height edges unavailable\n",
+                    kTapeCalibrationSensorChannels[sensor]);
+      continue;
+    }
+
+    const float sensorMeasuredCenterCm =
+        0.5f * (risingEdgeCoordinateCm + fallingEdgeCoordinateCm);
+    // Rotate each sensor's lateral X offset and the tape array's common
+    // forward Y offset into the world axis being calibrated.
+    const float sensorLocalXCm = kTapeCalibrationSensorLocalXCm[sensor];
+    const float sensorWorldOffsetXCm =
+        (cosf(headingRad) * sensorLocalXCm) -
+        (sinf(headingRad) * kTapeCalibrationSensorLocalYCm);
+    const float sensorWorldOffsetYCm =
+        (sinf(headingRad) * sensorLocalXCm) +
+        (cosf(headingRad) * kTapeCalibrationSensorLocalYCm);
+    const float sensorAxisOffsetCm = axis == TapeCalibrationAxis::X
+                                         ? sensorWorldOffsetXCm
+                                         : sensorWorldOffsetYCm;
+    const float robotCenterEquivalentCm =
+        sensorMeasuredCenterCm + sensorAxisOffsetCm;
+    measuredTapeCenterSumCm += robotCenterEquivalentCm;
+    ++validSensorCount;
+
+    Serial.printf("Tape ch%u: base=%.1f peak=%.1f edges=(%.2f,%.2f) "
+                  "offset=%.2f center=%.2f\n",
+                  kTapeCalibrationSensorChannels[sensor], sensorBaseline,
+                  sensorPeak, risingEdgeCoordinateCm, fallingEdgeCoordinateCm,
+                  sensorAxisOffsetCm, robotCenterEquivalentCm);
+  }
+
+  if (validSensorCount == 0) {
+    Serial.println("Tape calibration failed: no sensor produced both edges");
+    return false;
+  }
+  const float measuredTapeCenterCm = measuredTapeCenterSumCm / validSensorCount;
+
+  // The robot is now slightly beyond the tape because a peak can only be
+  // confirmed after the reading falls. Shift the current pose by the error at
+  // the measured edge midpoint instead of physically returning to the tape.
+  if (!driveTask.getCurrentPose(&pose)) {
+    Serial.println("Tape calibration failed: pose unavailable after search");
+    return false;
+  }
+  if (axis == TapeCalibrationAxis::X) {
+    pose.xCm += knownTapeCoordinateCm - measuredTapeCenterCm;
+  } else {
+    pose.yCm += knownTapeCoordinateCm - measuredTapeCenterCm;
+  }
+  if (!driveTask.setOtosPose(pose)) {
+    Serial.println("Tape calibration failed: pose update not queued");
+    return false;
+  }
+
+  const char axisName = axis == TapeCalibrationAxis::X ? 'X' : 'Y';
+  const float correctedCoordinateCm =
+      axis == TapeCalibrationAxis::X ? pose.xCm : pose.yCm;
+  Serial.printf("Tape %c calibrated from %u sensor(s): center=%.2f "
+                "current %c=%.2f cm drift=(%.2f cm,%.2f deg)\n",
+                axisName, validSensorCount, measuredTapeCenterCm, axisName,
+                correctedCoordinateCm, maxCrossTrackDriftCm,
+                maxHeadingDriftDeg);
+  return true;
+}
+
+bool calibrateXWithMiddleTapeSensor(float knownTapeXCm, float searchDirection,
+                                    float searchPower) {
+  return calibrateWithMiddleTapeSensor(TapeCalibrationAxis::X, knownTapeXCm,
+                                       searchDirection, searchPower);
+}
+
+bool calibrateYWithMiddleTapeSensor(float knownTapeYCm, float searchDirection,
+                                    float searchPower) {
+  return calibrateWithMiddleTapeSensor(TapeCalibrationAxis::Y, knownTapeYCm,
+                                       searchDirection, searchPower);
+}
+
 void stowGrabbedRock() {
   armTask.waitUntilSettled(1000);
   armTask.setTargetPosition({10.0f, 7.0f}, true);
@@ -225,7 +653,7 @@ void stowGrabbedRock() {
 
 void grabRock() {
   armTask.setTargetPosition({28.0f, -4.5f}, true);
-  armTask.waitUntilSettled(1500);
+  armTask.waitUntilSettled(1000);
   servo1.setAngle(clawClosedAngle);
   delay(500);
   armTask.setTargetPosition({28.0f, 16.0f}, true);
@@ -248,18 +676,37 @@ void grabRock() {
 }
 
 void runPath() {
-  driveTask.setTargetPose({0.0f, 50.0f, 0.0f}, 1.0f, true);
-  driveTask.waitUntilMotionFinished(2000);
+  // delay(2000);
+  // Print the three installed tape sensors continuously for diagnostics.
+
+  // delay(1000);
+  // servo1.setAngle(clawOpenAngle);
+  // delay(5000);
+  // servo1.setAngle(clawClosedAngle);
+  // while (true) {
+  //   continue;
+  // }
+
+  while (false) {
+    uint16_t tapeReadings[TapeSensorArray::CHANNEL_COUNT];
+    tapeSensors.readAll(tapeReadings);
+    Serial.printf("Tape raw: right(ch2)=%u center(ch4)=%u left(ch6)=%u\n",
+                  tapeReadings[2], tapeReadings[4], tapeReadings[6]);
+    delay(50);
+  }
+  // calibrateXWithMiddleTapeSensor(0.0f, -1.0f, 0.1f);
+  driveTask.setTargetPose({-4.5f, 50.0f, 0.0f}, 1.0f, true);
+  driveTask.waitUntilMotionFinished(10000);
 
   driveTask.setTargetPose({-4.5f, 95.0f, 0.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
   if (!rockHeld) {
-    delay(500);
+    driveTask.calibrateImuBlocking(750);
     if (confirmedMetalDetected(metalDetectorRight)) {
       servo1.setAngle(clawOpenAngle);
-      driveTask.setTargetPose({-6, 68, -43.0f}, 1.0f, true);
+      driveTask.setTargetPose({-7, 68.5, -43.0f}, 1.0f, true);
       driveTask.waitUntilMotionFinished(10000);
-      driveTask.setTargetPose({2.5, 77, -40.0f}, 1.0f);
+      driveTask.setTargetPose({2.5, 77, -40.0f}, 0.25f);
       driveTask.waitUntilMotionFinished(10000);
       grabRock();
       delay(500);
@@ -272,34 +719,36 @@ void runPath() {
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({10.5f, 132.0f, 0.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({9.0f, 150.0f, 15.0f}, 1.0f, true);
+  driveTask.setTargetPose({9.0f, 158.0f, 15.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({-7.5f, 168.0f, 61.5f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
+
   if (!rockHeld) {
-    delay(500);
+    driveTask.calibrateImuBlocking(750);
     if (confirmedMetalDetected(metalDetectorLeft)) {
       servo1.setAngle(clawOpenAngle);
-      driveTask.setTargetPose({-19, 180, 61.0f}, 1.0f);
+      driveTask.setTargetPose({-17, 180, 61.0f}, 1.0f);
       driveTask.waitUntilMotionFinished(10000);
-      driveTask.setTargetPose({-18, 184, -180.0f}, 1.0f);
+      driveTask.setTargetPose({-17, 184, -180.0f}, 1.0f);
       driveTask.waitUntilMotionFinished(10000);
-      driveTask.setTargetPose({-18, 172, -180.0f}, 1.0f);
+      driveTask.setTargetPose({-17, 172, -180.0f}, 0.25f);
       delay(500);
       grabRock();
     }
   }
 
-  driveTask.setTargetPose({-3.5f, 175.0f, 61.5f}, 1.0f);
   if (!rockHeld) {
-    delay(500);
+    driveTask.setTargetPose({-3.5f, 175.0f, 61.5f}, 1.0f);
+    driveTask.waitUntilMotionFinished(10000);
+    delay(650);
     if (confirmedMetalDetected(metalDetectorRight)) {
       servo1.setAngle(clawOpenAngle);
       driveTask.setTargetPose({-30, 185, 61.0f}, 1.0f);
       driveTask.waitUntilMotionFinished(10000);
       driveTask.setTargetPose({-28, 193, -90.0f}, 1.0f);
       driveTask.waitUntilMotionFinished(10000);
-      driveTask.setTargetPose({-19, 193, -90.0f}, 1.0f);
+      driveTask.setTargetPose({-19, 193, -90.0f}, 0.25f);
       driveTask.waitUntilMotionFinished(10000);
       delay(500);
       grabRock();
@@ -308,41 +757,41 @@ void runPath() {
 
   driveTask.setTargetPose({-28.5f, 187.0f, 90.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-47.0f, 184.0f, 145.0f}, 1.0f);
+  driveTask.setTargetPose({-49.5f, 182.0f, 145.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
 
   if (!rockHeld) {
-    delay(500);
+    driveTask.calibrateImuBlocking(750);
     if (confirmedMetalDetected(metalDetectorRight)) {
       servo1.setAngle(clawOpenAngle);
       driveTask.setTargetPose({-30, 189, 121.0f}, 1.0f, true);
       driveTask.waitUntilMotionFinished(10000);
       driveTask.setTargetPose({-34, 194, 88.0f}, 1.0f, true);
       driveTask.waitUntilMotionFinished(10000);
-      driveTask.setTargetPose({-43, 194, 88.0f}, 1.0f);
+      driveTask.setTargetPose({-43, 194, 88.0f}, 0.25f);
       driveTask.waitUntilMotionFinished(10000);
       grabRock();
     }
   }
 
-  driveTask.setTargetPose({-55.0f, 184.0f, 180.0f}, 1.0f, true);
+  driveTask.setTargetPose({-55.0f, 184.0f, 180.0f}, 0.8f);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-55.0f, 150.0f, 180.0f}, 1.0f, true);
+  driveTask.setTargetPose({-55.0f, 150.0f, 180.0f}, 0.8f, true);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-55.0f, 27.0f, 180.0f}, 1.0f);
+  driveTask.setTargetPose({-55.0f, 27.0f, 180.0f}, 0.8f);
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({-65.0f, 9.0f, 134.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
   if (!rockHeld) {
-    delay(500);
+    driveTask.calibrateImuBlocking(750);
     if (confirmedMetalDetected(metalDetectorLeft)) {
       servo1.setAngle(clawOpenAngle);
       delay(250);
-      driveTask.setTargetPose({-76.0f, 22.0f, 147.0f}, 1.0f);
+      driveTask.setTargetPose({-74.5f, 22.0f, 147.0f}, 1.0f);
       driveTask.waitUntilMotionFinished(10000);
       driveTask.setTargetPose({-74.5f, 20.0f, -140.0f}, 1.0f);
       driveTask.waitUntilMotionFinished(10000);
-      driveTask.setTargetPose({-67.0f, 11.0f, -140.0f}, 1.0f);
+      driveTask.setTargetPose({-67.0f, 11.0f, -140.0f}, 0.25f);
       driveTask.waitUntilMotionFinished(10000);
       delay(250);
       grabRock();
@@ -355,48 +804,307 @@ void runPath() {
   } else {
     driveTask.setTargetPose({-67, 21.5, 78}, 1.0);
     driveTask.waitUntilMotionFinished(10000);
-    driveTask.setTargetPose({-77.8, 19.2, 78}, 1.0);
+    driveTask.setTargetPose({-77.8, 19.2, 78}, 0.25);
     driveTask.waitUntilMotionFinished(10000);
     delay(250);
     grabRock();
   }
 
-  driveTask.setTargetPose({-100.0f, 4.0f, 90.0f}, 1.0f, true);
+  driveTask.setTargetPose({-100.0f, 5.0f, 90.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-130.0f, 4.0f, 90.0f}, 1.0f);
+  driveTask.setTargetPose({-130.0f, 5.0f, 90.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-144.0f, 97.0f, -90.0f}, 1.0f);
+  driveTask.setTargetPose({-130.0f, 5.0f, -90.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-128.0f, 95.0f, -90.0f}, 1.0f);
+  driveTask.setTargetPose({-130.0f, 0.0f, -90.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
+  if (!calibrateYWithMiddleTapeSensor(4.0f, 1.0f, 0.1f)) {
+    Serial.println("Continuing with the existing OTOS Y position");
+  }
+  driveTask.setTargetPose({-144.0f, 94.0f, -90.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-127.0f, 94.0f, -90.0f}, 0.1f);
+  driveTask.waitUntilMotionFinished(3000);
   servo1.setAngle(clawOpenAngle);
   delay(250);
-  armTask.setTargetPosition({25.5, 4.0}, true);
+  armTask.setTargetPosition({26.0, 4.0}, true);
   armTask.waitUntilSettled(500);
   servo1.setAngle(clawFullyClosedAngle);
   delay(500);
+
+  // OtosSensor::Pose currPose;
+  // if (!driveTask.getCurrentPose(&currPose)) {
+  //   Serial.println("Current pose unavailable");
+  // }
+  // driveTask.setOtosPose({currPose.xCm, currPose.yCm, -90.0f});
+
   armTask.setTargetPosition({24, 18}, true);
   armTask.waitUntilSettled(1000);
-  driveTask.setTargetPose({-134.0f, 140.0f, -90.0f}, 1.0f);
+  driveTask.setTargetPose({-140.0f, 95.0f, -90.0f}, 1.0f, true);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-140.0f, 140.0f, -90.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({-112.0f, 140.0f, -90.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
   armTask.setTargetPosition({28.0f, 0.0f}, true);
   delay(500);
   servo1.setAngle(clawOpenAngle);
-  driveTask.setTargetPose({-112.0f, 140.0f, -100.0f}, 1.0f, true);
+  driveTask.setTargetPose({-112.0f, 140.0f, -100.0f}, 0.3f);
   delay(500);
-  driveTask.setTargetPose({-112.0f, 140.0f, -80.0f}, 1.0f, true);
-  delay(1500);
-  driveTask.setTargetPose({-126.5f, 161.0f, 0.0f}, 1.0f);
+  driveTask.setTargetPose({-112.0f, 140.0f, -80.0f}, 0.3f);
+  delay(500);
+  driveTask.setMotionTolerance(0.5f, 1.5f);
+  driveTask.setTargetPose({-127.0f, 158.5f, 0.0f}, 0.5f);
   delay(250);
-  armTask.setTargetPosition({28.0f, -7.0f}, true);
+  armTask.setTargetPosition({26.5f, -5.0f}, true);
   servo1.setAngle(clawFullyClosedAngle);
-  armTask.waitUntilSettled(500);
   driveTask.waitUntilMotionFinished(10000);
   delay(500);
-  driveTask.setTargetPose({-126.5f, 166.0f, 0.0f}, 1.0f);
+  OtosSensor::Pose actualPickupPose;
+  if (driveTask.getCurrentPose(&actualPickupPose)) {
+    const OtosSensor::Pose pickupTarget{-127.0f, 158.5f, 0.0f};
+    const OtosSensor::Pose pickupReference{-125.0f, 160.0f, 0.0f};
 
+    const OtosSensor::Pose correctedPickupReference{
+        actualPickupPose.xCm - -127.0f + pickupReference.xCm,
+        actualPickupPose.yCm - 158.5f + pickupReference.yCm,
+        pickupReference.headingDeg + actualPickupPose.headingDeg};
+    if (!driveTask.setOtosPose(correctedPickupReference)) {
+      Serial.println("Failed to queue corrected pickup pose");
+      while (true) {
+        Serial.println("Failed to queue corrected pickup pose");
+        delay(100);
+      }
+    }
+  } else {
+    while (true) {
+      Serial.println("Pickup pose unavailable; pose reference not changed");
+      delay(100);
+    }
+  }
+  driveTask.setMotionTolerance(0.5f, 1.0f);
+  //  driveTask.setOtosPose({-125, 160.5, 0});
+  delay(250);
+  driveTask.setTargetPose({-137.5f, 160.5f, 0.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  // Calibrate X when the centered middle tape sensor is over the known
+  // line.
+  if (!calibrateXWithMiddleTapeSensor(-151.7f, -1.0f, 0.1f)) {
+    Serial.println("Continuing with the existing OTOS X position");
+  }
+  OtosSensor::Pose currentPose;
+  if (!driveTask.getCurrentPose(&currentPose)) {
+    Serial.println("Current pose unavailable");
+  }
+  armTask.setTargetPosition({26.5f, -5.0f}, true);
+  driveTask.setTargetPose({currentPose.xCm, 162.0f, 0.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(1000);
+
+  // armTask.setTargetPosition({28.0f, -8.0f}, true);
+  // servo1.setAngle(clawFullyClosedAngle);
+  // delay(500);
+  // driveTask.setTargetPose({-125.0f, 170.0f, 0.0f}, 0.2f);
+  // driveTask.waitUntilMotionFinished(10000);
+  // armTask.setTargetPosition({28.0f, 0.0f}, true);
+  // delay(1000);
+  // servo1.setAngle(clawHabitatOpenAngle);
+  // armTask.setTargetPosition({28.0f, 10.0f}, true);
+  // armTask.waitUntilSettled(1000);
+  // driveTask.setTargetPose({-125.0f, 138.5f, 0.0f}, 0.4f);
+  // driveTask.waitUntilMotionFinished(10000);
+  // driveTask.setTargetPose({-125.0f, 138.5f, 90.0f}, 0.4f);
+  // driveTask.waitUntilMotionFinished(10000);
+  // driveTask.setTargetPose({-155.5f, 138.5f, 90.0f}, 0.4f);
+  // driveTask.waitUntilMotionFinished(10000);
+  // armTask.setTargetPosition({28.0f, -8.0f}, true);
+  // armTask.waitUntilSettled(1500);
+  // servo1.setAngle(clawFullyClosedAngle);
+  // delay(500);
+  // driveTask.setTargetPose({-155.5f, 138.5f, 85.0f}, 0.4f);
+  // delay(500);
+  // driveTask.setTargetPose({-155.5f, 138.5f, 95.0f}, 0.4f);
+  // delay(500);
+  // driveTask.setTargetPose({-147.5f, 138.5f, 90.0f}, 0.4f);
+  // driveTask.waitUntilMotionFinished(10000);
+  // driveTask.setTargetPose({-147.5f, 148.5f, 90.0f}, 0.4f);
+  // driveTask.waitUntilMotionFinished(10000);
+  // driveTask.setTargetPose({-156.5f, 148.5f, 90.0f}, 0.4f);
+  // driveTask.waitUntilMotionFinished(10000);
+  // driveTask.setTargetPose({-156.5f, 126.5f, 90.0f}, 0.4f);
+  // driveTask.waitUntilMotionFinished(10000);
+  // driveTask.setTargetPose({-143.5f, 126.5f, 90.0f}, 0.4f);
+  // driveTask.waitUntilMotionFinished(10000);
+  // driveTask.setTargetPose({-143.5f, 138.5f, 0.0f}, 0.4f);
+  // driveTask.waitUntilMotionFinished(10000);
+  // driveTask.setTargetPose({-143.5f, 163.0f, 0.0f}, 0.4f);
+  // driveTask.waitUntilMotionFinished(10000);
+
+  driveTask.setTargetPose({-180.5f, 161.5f, 0.0f}, 0.3f);
+  servo1.setAngle(clawFullyClosedAngle);
+  armTask.setTargetPosition({26.0f, -8.0f}, true);
+  driveTask.waitUntilMotionFinished(2250);
+
+  delay(500);
+  driveTask.setTargetPose({-180.5f, 170.0f, 0.0f}, 0.1f);
+  driveTask.waitUntilMotionFinished(10000);
+  armTask.setTargetPosition({28.0f, 0.0f}, true);
+  delay(1000);
+  servo1.setAngle(clawHabitatOpenAngle);
+  armTask.setTargetPosition({28.0f, 10.0f}, true);
+  armTask.waitUntilSettled(1000);
+  driveTask.setTargetPose({-185.0f, 175.0f, 0.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-185.0f, 175.0f, 45.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-155.5f, 138.5f, 45.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-155.5f, 137.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  armTask.setTargetPosition({28.0f, -8.0f}, true);
+  armTask.waitUntilSettled(1500);
+  servo1.setAngle(clawFullyClosedAngle);
+  delay(500);
+  driveTask.setTargetPose({-155.5f, 138.5f, 85.0f}, 0.3f);
+  delay(500);
+  driveTask.setTargetPose({-155.5f, 138.5f, 95.0f}, 0.3f);
+  delay(500);
+  driveTask.setTargetPose({-147.5f, 138.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  armTask.setTargetPosition({28.0f, -5.0f}, true);
+  driveTask.setTargetPose({-147.5f, 148.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-158.0f, 148.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-157.0f, 126.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-143.5f, 126.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-143.5f, 138.5f, 0.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+
+  driveTask.setTargetPose({-142.5f, 162.0f, 0.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  armTask.setTargetPosition({28.0f, -8.0f}, true);
+  armTask.waitUntilSettled(500);
+  delay(500);
+  driveTask.setTargetPose({-142.5f, 170.0f, 0.0f}, 0.1f);
+  driveTask.waitUntilMotionFinished(10000);
+  armTask.setTargetPosition({28.0f, 0.0f}, true);
+  delay(1000);
+  servo1.setAngle(clawHabitatOpenAngle);
+  armTask.setTargetPosition({28.0f, 10.0f}, true);
+  armTask.waitUntilSettled(1000);
+  driveTask.setTargetPose({-143.0f, 138.5f, 0.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-143.0f, 138.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+
+  driveTask.setTargetPose({-155.5f, 137.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  armTask.setTargetPosition({28.0f, -8.0f}, true);
+  armTask.waitUntilSettled(1500);
+  servo1.setAngle(clawFullyClosedAngle);
+  delay(500);
+  driveTask.setTargetPose({-155.5f, 138.5f, 85.0f}, 0.3f);
+  delay(500);
+  driveTask.setTargetPose({-155.5f, 138.5f, 95.0f}, 0.3f);
+  delay(500);
+  driveTask.setTargetPose({-147.5f, 138.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  armTask.setTargetPosition({28.0f, -5.0f}, true);
+  driveTask.setTargetPose({-147.5f, 148.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-158.0f, 148.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-157.0f, 126.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-143.5f, 126.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-161.5f, 161.0f, 0.0f}, 0.3);
+  driveTask.waitUntilMotionFinished(10000);
+  armTask.setTargetPosition({28.0f, -8.0f}, true);
+  armTask.waitUntilSettled(500);
+  delay(500);
+  driveTask.setTargetPose({-161.5f, 170.0f, 0.0f}, 0.1f);
+  driveTask.waitUntilMotionFinished(10000);
+  armTask.setTargetPosition({28.0f, 0.0f}, true);
+  delay(1000);
+  servo1.setAngle(clawHabitatOpenAngle);
+  armTask.setTargetPosition({28.0f, 10.0f}, true);
+  armTask.waitUntilSettled(1000);
+  driveTask.setTargetPose({-161.8f, 150.0f, 0.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-143.5f, 138.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-155.5f, 137.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  armTask.setTargetPosition({28.0f, -8.0f}, true);
+  armTask.waitUntilSettled(1500);
+  servo1.setAngle(clawFullyClosedAngle);
+  delay(500);
+  driveTask.setTargetPose({-155.5f, 138.5f, 85.0f}, 0.3f);
+  delay(500);
+  driveTask.setTargetPose({-155.5f, 138.5f, 95.0f}, 0.3f);
+  delay(500);
+  driveTask.setTargetPose({-140.0f, 138.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  armTask.setTargetPosition({28.0f, -5.0f}, true);
+  driveTask.setTargetPose({-147.5f, 138.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-147.5f, 148.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-158.0f, 148.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-157.0f, 126.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-143.5f, 126.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+
+  driveTask.setTargetPose({-124.9f, 162.0f, 0.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  armTask.setTargetPosition({28.0f, -8.0f}, true);
+  armTask.waitUntilSettled(1000);
+  driveTask.setTargetPose({-124.9f, 170.0f, 0.0f}, 0.1f);
+  driveTask.waitUntilMotionFinished(10000);
+  armTask.setTargetPosition({28.0f, 0.0f}, true);
+  delay(1000);
+  servo1.setAngle(clawHabitatOpenAngle);
+  armTask.setTargetPosition({28.0f, 10.0f}, true);
+  armTask.waitUntilSettled(1000);
+  driveTask.setTargetPose({-125.0f, 138.5f, 0.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-125.0f, 138.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-155.5f, 137.5f, 90.0f}, 0.3f);
+  driveTask.waitUntilMotionFinished(10000);
+  armTask.setTargetPosition({28.0f, -8.0f}, true);
+  armTask.waitUntilSettled(1500);
+  servo1.setAngle(clawFullyClosedAngle);
+  delay(500);
+  driveTask.setTargetPose({-155.5f, 138.5f, 85.0f}, 0.3f);
+  delay(500);
+  driveTask.setTargetPose({-155.5f, 138.5f, 95.0f}, 0.3f);
+  delay(500);
+  driveTask.setTargetPose({-147.5f, 138.5f, 90.0f}, 0.3f);
+
+  // driveTask.waitUntilMotionFinished(10000);
+  // driveTask.setTargetPose({-147.5f, 148.5f, 90.0f}, 0.4f);
+  // driveTask.waitUntilMotionFinished(10000);
+  // driveTask.setTargetPose({-156.5f, 148.5f, 90.0f}, 0.4f);
+  // driveTask.waitUntilMotionFinished(10000);
+  // driveTask.setTargetPose({-156.5f, 126.5f, 90.0f}, 0.4f);
+  // driveTask.waitUntilMotionFinished(10000);
+  // driveTask.setTargetPose({-143.5f, 126.5f, 90.0f}, 0.4f);
+  // driveTask.waitUntilMotionFinished(10000);
+  // driveTask.setTargetPose({-143.5f, 138.5f, 0.0f}, 0.4f);
+  // driveTask.waitUntilMotionFinished(10000);
+  // driveTask.setTargetPose({-143.5f, 163.0f, 0.0f}, 0.4f);
+  // driveTask.waitUntilMotionFinished(10000);
+
+  // driveTask.setTargetPose({-143.5f,
+  // delay(500);
+  // driveTask.setTargetPose({-126.5f, 166.0f, 0.0f}, 1.0f);
+  // driveTask.waitUntilMotionFinished(10000);
   /*
     servo1.setAngle(15);
     delay(3000);
@@ -478,7 +1186,6 @@ void setup() {
   Serial.println("Drive task " +
                  String(driveTaskReady ? "ready" : "not started"));
   Serial.println("Arm task " + String(armTaskReady ? "ready" : "not started"));
-
   if (armTaskReady) {
     const bool gravityCompensationConfigured =
         armConfig.gravityA1Percent != 0.0f ||
@@ -502,6 +1209,7 @@ void setup() {
   }
 
   // Reset the OTOS coordinate system through its owning task:
+  driveTask.calibrateImuBlocking(2000);
   driveTask.setOtosPose({0.0f, 0.0f, 0.0f});
   // hbridge1.setSpeedPercent(20.0f);
   // hbridge2.setSpeedPercent(20.0f);
@@ -528,7 +1236,7 @@ void setup() {
   // delay(1000);
   // servo1.disable();
   // armTask.setTargetAngles({90.0f, -90.0f});
-  servo1.setAngle(50);
+  servo1.setAngle(clawOpenAngle);
   armTask.setTargetPosition({28.0f, -4.5f}, true);
   // armTask.waitUntilSettled(1500);
   // grabRock();
@@ -544,6 +1252,12 @@ void setup() {
   // armTask.setTargetPosition({10.80f, 13.0f}, true);
 
   runPath();
+  // delay(2000);
+  // Serial.printf("calibrating X with middle tape sensor\n");
+  // calibrateXWithMiddleTapeSensor(0.0f, -1.0f, 0.05f);
+  // Serial.printf("calibrated\n");
+
+  // driveTask.setTargetPose({0.0f, 0.0f, 0.0f}, 0.1f);
   // armTask.setTargetPosition({25.0f, 11.0f}, true);
   // armTask.waitUntilSettled(3000);
   // armTask.setTargetPosition({15.0f, 11.0f}, true);
@@ -552,6 +1266,7 @@ void setup() {
   // armTask.waitUntilSettled(3000);
   // // servo1.setAngle(clawOpenAngle);
   // armTask.setTargetPosition({10.80f, 13.0f}, true);
+
   while (false) {
     MetalDetector::Reading detectorLeftReading;
     MetalDetector::Reading detectorRightReading;

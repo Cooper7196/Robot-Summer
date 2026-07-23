@@ -31,6 +31,8 @@ public:
   static constexpr float POSE_HEADING_KD = 0.0011f;
   static constexpr float POSE_INTERMEDIARY_MIN_TRANSLATION_POWER = 0.20f;
   static constexpr float POSE_INTERMEDIARY_MIN_HEADING_POWER = 0.12f;
+  static constexpr float POSE_INTERMEDIARY_POSITION_TOLERANCE_MULTIPLIER =
+      4.0f;
   static constexpr uint32_t DISABLED_STOP_REASSERT_PERIOD_MS = 100;
 
   MecanumDrive(Motor &frontLeft, Motor &frontRight, Motor &backLeft,
@@ -40,12 +42,19 @@ public:
   void drive(float xVelocity, float yVelocity, float omega);
   void setTargetPose(const OtosSensor::Pose &targetPose,
                      float maxPower = 1.0f,
-                     bool intermediaryPosition = false);
+                     bool intermediaryPosition = false,
+                     float maxHeadingPower = -1.0f,
+                     float minHeadingPower = 0.0f,
+                     float headingToleranceDeg = -1.0f);
   bool updatePoseTarget(OtosSensor &otosSensor);
   bool updatePoseTarget(const OtosSensor::Pose &currentPose);
   bool hasPoseTarget() const;
   bool atPoseTarget() const;
   void cancelPoseTarget();
+  // Sets the x/y position tolerance in centimetres and heading tolerance in
+  // degrees used to decide when a pose target has been reached.
+  bool setMotionTolerance(float positionToleranceCm,
+                          float headingToleranceDeg);
   bool driveToPose(OtosSensor &otosSensor, const OtosSensor::Pose &targetPose,
                    const float maxPower = 1.0f,
                    bool intermediaryPosition = false);
@@ -66,8 +75,9 @@ private:
   bool enabled() const;
   bool updateDriveToPose(const OtosSensor::Pose &currentPose,
                          const OtosSensor::Pose &targetPose,
-                         const float maxPower,
-                         bool intermediaryPosition);
+                         float maxPower, bool intermediaryPosition,
+                         float maxHeadingPower, float minHeadingPower,
+                         float headingToleranceDeg);
   // void setWheelSpeeds(float frontLeft, float frontRight, float backLeft,
   //                     float backRight);
 
@@ -91,6 +101,11 @@ private:
   bool hasPathStartPose_;
   OtosSensor::Pose targetPose_;
   float targetMaxPower_;
+  float targetMaxHeadingPower_;
+  float targetMinHeadingPower_;
+  float targetHeadingToleranceDeg_;
+  float positionToleranceCm_;
+  float headingToleranceDeg_;
   bool targetIsIntermediary_;
   bool hasPoseTarget_;
   bool atPoseTarget_;
