@@ -2,7 +2,9 @@
 
 PwmExpander::PwmExpander(uint8_t address, TwoWire &wire)
     : address_(address), wire_(&wire), driver_(address, wire),
-      initialized_(false) {}
+      initialized_(false), voltageNormalizationEnabled_(false),
+      voltageSensePin_(0), voltageDividerRatio_(1.0f), targetVoltage_(0.0f),
+      supplyVoltage_(0.0f), lastVoltageSampleMs_(0) {}
 
 bool PwmExpander::begin(uint8_t sdaPin, uint8_t sclPin, float pwmFrequencyHz,
                         uint32_t i2cClockHz) {
@@ -29,6 +31,57 @@ bool PwmExpander::isConnected() const {
   return wire_->endTransmission() == 0;
 }
 
+void PwmExpander::enableVoltageNormalization(uint8_t sensePin,
+                                             float dividerRatio,
+                                             float targetVoltage) {
+  if (dividerRatio <= 0.0f || targetVoltage <= 0.0f) {
+    voltageNormalizationEnabled_ = false;
+    return;
+  }
+
+  voltageSensePin_ = sensePin;
+  voltageDividerRatio_ = dividerRatio;
+  targetVoltage_ = targetVoltage;
+  supplyVoltage_ = 0.0f;
+  lastVoltageSampleMs_ = 0;
+  pinMode(voltageSensePin_, INPUT);
+  analogSetPinAttenuation(voltageSensePin_, ADC_11db);
+  voltageNormalizationEnabled_ = true;
+  updateSupplyVoltage();
+}
+
+float PwmExpander::supplyVoltage() {
+  updateSupplyVoltage();
+  return supplyVoltage_;
+}
+
+void PwmExpander::updateSupplyVoltage() {
+  if (!voltageNormalizationEnabled_) {
+    return;
+  }
+
+  constexpr uint32_t kSampleIntervalMs = 20;
+  constexpr uint8_t kSamplesPerReading = 4;
+  const uint32_t nowMs = millis();
+  if (supplyVoltage_ > 0.0f &&
+      nowMs - lastVoltageSampleMs_ < kSampleIntervalMs) {
+    return;
+  }
+
+  uint32_t senseMillivolts = 0;
+  for (uint8_t sample = 0; sample < kSamplesPerReading; ++sample) {
+    senseMillivolts += analogReadMilliVolts(voltageSensePin_);
+  }
+  senseMillivolts /= kSamplesPerReading;
+  lastVoltageSampleMs_ = nowMs;
+
+  // Retain the previous valid reading through an isolated bad ADC sample.
+  if (senseMillivolts > 0) {
+    supplyVoltage_ =
+        (static_cast<float>(senseMillivolts) / 1000.0f) * voltageDividerRatio_;
+  }
+}
+
 void PwmExpander::setChannel(uint8_t channel, uint16_t value) {
   if (!initialized_) {
     return;
@@ -50,6 +103,13 @@ void PwmExpander::setChannel(uint8_t channel, uint16_t value) {
 void PwmExpander::setChannelPercent(uint8_t channel, float percent) {
   if (!initialized_) {
     return;
+  }
+
+  updateSupplyVoltage();
+  if (voltageNormalizationEnabled_ && supplyVoltage_ > 0.0f) {
+    // A requested percentage represents that fraction of the target voltage.
+    // Duty is capped below when the battery cannot produce the target voltage.
+    percent *= targetVoltage_ / supplyVoltage_;
   }
 
   if (percent <= 0.0f) {

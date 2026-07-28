@@ -15,14 +15,26 @@ public:
              uint32_t i2cClockHz = 100000);
   bool isConnected() const;
 
+  void enableVoltageNormalization(uint8_t sensePin, float dividerRatio,
+                                  float targetVoltage);
+  float supplyVoltage();
+
   void setChannel(uint8_t channel, uint16_t value);
   void setChannelPercent(uint8_t channel, float percent);
   void setChannelOff(uint8_t channel);
   void setAllOff();
 
 private:
+  void updateSupplyVoltage();
+
   uint8_t address_;
   TwoWire *wire_;
   Adafruit_PWMServoDriver driver_;
   bool initialized_;
+  bool voltageNormalizationEnabled_;
+  uint8_t voltageSensePin_;
+  float voltageDividerRatio_;
+  float targetVoltage_;
+  float supplyVoltage_;
+  uint32_t lastVoltageSampleMs_;
 };

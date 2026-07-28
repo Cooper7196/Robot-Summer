@@ -26,6 +26,8 @@ constexpr uint8_t MD_RIGHT_PIN = 14;
 constexpr uint8_t PWM_EXPANDER_SCL_PIN = 15;
 constexpr uint8_t PWM_EXPANDER_SDA_PIN = 16;
 
+constexpr uint8_t BATTERY_VOLTAGE_PIN = 17;
+
 constexpr uint8_t EXTRA1_PIN = 41;
 constexpr uint8_t EXTRA2_PIN = 42;
 
