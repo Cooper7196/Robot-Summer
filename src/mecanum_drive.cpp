@@ -12,6 +12,7 @@ MecanumDrive::MecanumDrive(Motor &frontLeft, Motor &frontRight, Motor &backLeft,
       targetMaxPower_(1.0f), targetMaxHeadingPower_(1.0f),
       targetMinHeadingPower_(0.0f),
       targetHeadingToleranceDeg_(POSE_HEADING_TOLERANCE_DEG),
+      targetCrossTrackKp_(0.0f),
       positionToleranceCm_(POSE_POSITION_TOLERANCE_CM),
       headingToleranceDeg_(POSE_HEADING_TOLERANCE_DEG),
       targetIsIntermediary_(false), hasPoseTarget_(false),
@@ -47,7 +48,8 @@ void MecanumDrive::setTargetPose(const OtosSensor::Pose &targetPose,
                                  bool intermediaryPosition,
                                  float maxHeadingPower,
                                  float minHeadingPower,
-                                 float headingToleranceDeg) {
+                                 float headingToleranceDeg,
+                                 float crossTrackKp) {
   targetPose_ = targetPose;
   targetMaxPower_ = clamp(maxPower, 0.0f, 1.0f);
   targetMaxHeadingPower_ =
@@ -57,6 +59,7 @@ void MecanumDrive::setTargetPose(const OtosSensor::Pose &targetPose,
       clamp(minHeadingPower, 0.0f, targetMaxHeadingPower_);
   targetHeadingToleranceDeg_ =
       headingToleranceDeg > 0.0f ? headingToleranceDeg : headingToleranceDeg_;
+  targetCrossTrackKp_ = fmaxf(crossTrackKp, 0.0f);
   targetIsIntermediary_ = intermediaryPosition;
   hasPoseTarget_ = true;
   atPoseTarget_ = false;
@@ -97,7 +100,8 @@ bool MecanumDrive::updatePoseTarget(const OtosSensor::Pose &currentPose) {
 
   if (updateDriveToPose(currentPose, targetPose_, targetMaxPower_,
                         targetIsIntermediary_, targetMaxHeadingPower_,
-                        targetMinHeadingPower_, targetHeadingToleranceDeg_)) {
+                        targetMinHeadingPower_, targetHeadingToleranceDeg_,
+                        targetCrossTrackKp_)) {
     hasPoseTarget_ = false;
     atPoseTarget_ = true;
   }
@@ -157,7 +161,7 @@ bool MecanumDrive::driveToPose(OtosSensor &otosSensor,
 
     if (updateDriveToPose(currentPose, targetPose, maxPower,
                           intermediaryPosition, maxPower, 0.0f,
-                          headingToleranceDeg_)) {
+                          headingToleranceDeg_, 0.0f)) {
       return true;
     }
 
@@ -171,7 +175,8 @@ bool MecanumDrive::updateDriveToPose(const OtosSensor::Pose &currentPose,
                                      bool intermediaryPosition,
                                      float maxHeadingPower,
                                      float minHeadingPower,
-                                     float headingToleranceDeg) {
+                                     float headingToleranceDeg,
+                                     float crossTrackKp) {
   const uint32_t nowMs = millis();
   const float dtSec =
       lastPosePidMs_ != 0 ? (nowMs - lastPosePidMs_) / 1000.0f : 0.0f;
@@ -244,6 +249,8 @@ bool MecanumDrive::updateDriveToPose(const OtosSensor::Pose &currentPose,
   const float pathLength = hypotf(pathX, pathY);
   float waypointX = targetPose.xCm;
   float waypointY = targetPose.yCm;
+  float crossTrackCorrectionX = 0.0f;
+  float crossTrackCorrectionY = 0.0f;
 
   if (pathLength > 0.001f) {
     const float pathUnitX = pathX / pathLength;
@@ -256,6 +263,20 @@ bool MecanumDrive::updateDriveToPose(const OtosSensor::Pose &currentPose,
         clamp(projectedDistance + POSE_PATH_LOOKAHEAD_CM, 0.0f, pathLength);
     waypointX = pathStartPose_.xCm + (pathUnitX * lookaheadDistance);
     waypointY = pathStartPose_.yCm + (pathUnitY * lookaheadDistance);
+
+    // The lookahead target alone gives weak lateral correction during
+    // low-power straight-line moves. Apply an optional direct correction
+    // perpendicular to the path; the final translation clamp keeps the
+    // combined command within maxPower.
+    const float pathNormalX = -pathUnitY;
+    const float pathNormalY = pathUnitX;
+    const float crossTrackError =
+        (currentFromStartX * pathNormalX) +
+        (currentFromStartY * pathNormalY);
+    const float correctionPower =
+        clamp(-crossTrackKp * crossTrackError, -maxPower, maxPower);
+    crossTrackCorrectionX = correctionPower * pathNormalX;
+    crossTrackCorrectionY = correctionPower * pathNormalY;
   }
 
   const float waypointXError = waypointX - currentPose.xCm;
@@ -271,6 +292,8 @@ bool MecanumDrive::updateDriveToPose(const OtosSensor::Pose &currentPose,
     xCommand = translationPower * waypointXError / waypointDistance;
     yCommand = translationPower * waypointYError / waypointDistance;
   }
+  xCommand += crossTrackCorrectionX;
+  yCommand += crossTrackCorrectionY;
 
   if (hasVelocityEstimate) {
     xCommand -= POSE_X_KD * xVelocity;

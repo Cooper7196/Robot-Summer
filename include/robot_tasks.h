@@ -20,7 +20,8 @@ public:
                      bool intermediaryPosition = false,
                      float maxHeadingPower = -1.0f,
                      float minHeadingPower = 0.0f,
-                     float headingToleranceDeg = -1.0f);
+                     float headingToleranceDeg = -1.0f,
+                     float crossTrackKp = 0.0f);
   // Applies to subsequent updates of the current motion as well as future
   // motions. Position is in centimetres and heading is in degrees.
   bool setMotionTolerance(float positionToleranceCm,
@@ -56,6 +57,7 @@ private:
     float maxHeadingPower;
     float minHeadingPower;
     float targetHeadingToleranceDeg;
+    float crossTrackKp;
     float positionToleranceCm;
     float headingToleranceDeg;
     uint32_t gyroCalibrationSamples;
@@ -63,7 +65,8 @@ private:
 
   static void taskEntry(void *context);
   void run();
-  void updateSnapshot(const OtosSensor::Pose &pose, bool valid);
+  void updateSnapshot(const OtosSensor::Pose &pose, bool valid,
+                      uint32_t timestampMs = 0);
   void updateStatus(bool busy, bool atTarget);
 
   MecanumDrive *drive_;
@@ -73,6 +76,7 @@ private:
   QueueHandle_t commandQueue_;
   TaskHandle_t taskHandle_;
   OtosSensor::Pose currentPose_;
+  uint32_t currentPoseTimestampMs_;
   bool poseValid_;
   bool busy_;
   bool atTarget_;

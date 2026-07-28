@@ -45,7 +45,8 @@ public:
                      bool intermediaryPosition = false,
                      float maxHeadingPower = -1.0f,
                      float minHeadingPower = 0.0f,
-                     float headingToleranceDeg = -1.0f);
+                     float headingToleranceDeg = -1.0f,
+                     float crossTrackKp = 0.0f);
   bool updatePoseTarget(OtosSensor &otosSensor);
   bool updatePoseTarget(const OtosSensor::Pose &currentPose);
   bool hasPoseTarget() const;
@@ -77,7 +78,7 @@ private:
                          const OtosSensor::Pose &targetPose,
                          float maxPower, bool intermediaryPosition,
                          float maxHeadingPower, float minHeadingPower,
-                         float headingToleranceDeg);
+                         float headingToleranceDeg, float crossTrackKp);
   // void setWheelSpeeds(float frontLeft, float frontRight, float backLeft,
   //                     float backRight);
 
@@ -104,6 +105,7 @@ private:
   float targetMaxHeadingPower_;
   float targetMinHeadingPower_;
   float targetHeadingToleranceDeg_;
+  float targetCrossTrackKp_;
   float positionToleranceCm_;
   float headingToleranceDeg_;
   bool targetIsIntermediary_;
