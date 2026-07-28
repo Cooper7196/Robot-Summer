@@ -1,6 +1,7 @@
 #include "angle_servo.h"
 #include "arm.h"
 #include "as5600_encoder.h"
+#include "camera_detector.h"
 #include "mecanum_drive.h"
 #include "metal_detector.h"
 #include "motor.h"
@@ -30,18 +31,59 @@ constexpr float kTapeCalibrationMaxHeadingPower = 0.15f;
 constexpr float kTapeCalibrationMinHeadingPower = 0.00f;
 constexpr float kTapeCalibrationHeadingToleranceDeg = 1.0f;
 constexpr float kTapeCalibrationMinPeakRise = 100.0f;
-constexpr uint8_t kTapeCalibrationRiseConfirmSamples = 5;
-constexpr float kTapeCalibrationMinTravelPastPeakCm = 1.0f;
-constexpr uint8_t kTapeCalibrationPeakConfirmSamples = 2;
+// Average several MCP3008 conversions at each calibration position before the
+// spatial profile and temporal median filters see the reading.
+constexpr uint8_t kTapeCalibrationOversampleCount = 4;
+// Use a low percentile of the background profile rather than its absolute
+// minimum. This remains representative of the floor while ignoring isolated
+// low readings that survive the short temporal median filter.
+constexpr uint8_t kTapeCalibrationBaselinePercentile = 25;
+// The rolling five-reading median already rejects isolated ADC spikes.
+// Requiring five additional spatial profile samples made narrow tape easy to
+// miss unless the robot crossed it unusually slowly.
+constexpr uint8_t kTapeCalibrationRiseConfirmSamples = 2;
+// The outer sensors can cross an axis-aligned tape up to 2.4 cm after the
+// middle sensor. Continue beyond the middle peak so all three profiles include
+// their falling half-height edge.
+constexpr float kTapeCalibrationMinTravelPastPeakCm = 3.5f;
+constexpr uint8_t kTapeCalibrationPeakConfirmSamples = 1;
 constexpr float kTapeCalibrationProfileSpacingCm = 0.05f;
 constexpr uint16_t kTapeCalibrationMaxProfileSamples = 640;
 constexpr uint32_t kCalibrationSettleDelayMs = 250;
 constexpr float kMetalAnomalyThresholdHz = 90.0f;
 constexpr uint8_t kMetalDeviationAverageSamples = 5;
-// Adjust this signed value until the elbow just begins moving. Use a
-// negative value to measure friction in the opposite direction.
-constexpr bool kElbowConstantPidTestEnabled = false;
-constexpr float kElbowConstantPidTestPercent = -9.0f;
+// Calibrated against a 16.20 V multimeter reading (ADC initially reported
+// 15.77 V with the nominal 6.5:1 divider ratio).
+constexpr float kBatteryVoltageDividerRatio = 6.69f;
+constexpr float kNormalizedMotorVoltage = 15.4f;
+enum class ArmTuningMode { Disabled, StaticFriction, Velocity, Position };
+
+// StaticFriction applies the signed manual PWM below on top of gravity.
+// Velocity applies the fixed signed target speed below directly to the inner
+// velocity loop. Position alternates a bounded angle step through the cascaded
+// controller. The other joint holds its startup angle and autonomous operation
+// is bypassed.
+constexpr ArmTuningMode kArmTuningMode = ArmTuningMode::Disabled;
+constexpr bool kTuneShoulder = false;
+constexpr bool kHoldOtherJointDuringTuning = true;
+constexpr float kArmStaticFrictionManualPwmPercent = 20.0f;
+constexpr float kArmManualTargetVelocityDegPerSec = 10.0f;
+constexpr float kArmVelocityTuningMaxTravelDeg = 45.0f;
+constexpr float kArmPositionTuningStepDeg = 30.0f;
+constexpr float kArmPositionTuningMaxVelocityDegPerSec = 50.0f;
+constexpr uint32_t kArmPositionTuningInitialHoldMs = 2000;
+constexpr uint32_t kArmPositionTuningStepHoldMs = 4000;
+// Exponential velocity filter coefficient: lower is smoother but adds lag.
+// At the 4 ms arm update period, 0.10 is approximately a 4 Hz low-pass filter.
+constexpr float kArmVelocityFilterAlpha = 0.10f;
+constexpr bool kArmStaticFrictionTuningEnabled =
+    kArmTuningMode == ArmTuningMode::StaticFriction;
+constexpr bool kArmVelocityTuningEnabled =
+    kArmTuningMode == ArmTuningMode::Velocity;
+constexpr bool kArmPositionTuningEnabled =
+    kArmTuningMode == ArmTuningMode::Position;
+constexpr bool kArmTuningEnabled = kArmTuningMode != ArmTuningMode::Disabled;
+constexpr uint32_t kArmVelocityTuningLogPeriodMs = 100;
 
 // Replace these with each AS5600's raw reading at the position that should be
 // reported as 0 degrees.
@@ -77,6 +119,26 @@ float voltsFromAdcCount(uint16_t count) {
          kTapeAdcReferenceVolts;
 }
 
+float tapeReadingPercentile(
+    const uint16_t histogram[TapeSensorArray::MAX_READING + 1],
+    uint16_t sampleCount, uint8_t percentile) {
+  if (sampleCount == 0) {
+    return 0.0f;
+  }
+
+  const uint32_t targetRank =
+      (static_cast<uint32_t>(sampleCount - 1) * percentile) / 100U;
+  uint32_t cumulativeCount = 0;
+  for (uint16_t reading = 0; reading <= TapeSensorArray::MAX_READING;
+       ++reading) {
+    cumulativeCount += histogram[reading];
+    if (cumulativeCount > targetRank) {
+      return static_cast<float>(reading);
+    }
+  }
+  return static_cast<float>(TapeSensorArray::MAX_READING);
+}
+
 MetalDetector::Config makeMetalDetectorConfig() {
   MetalDetector::Config config;
   config.anomalyThresholdHz = kMetalAnomalyThresholdHz;
@@ -87,6 +149,7 @@ MetalDetector::Config makeMetalDetectorConfig() {
 PwmExpander pwmExpander;
 AngleServo servo1(pins::SERVO1_PWM_PIN);
 OtosSensor otosSensor(Serial1);
+CameraDetector cameraDetector(Serial2);
 TapeSensorArray tapeSensors;
 MetalDetector::Config metalDetectorConfig = makeMetalDetectorConfig();
 MetalDetector metalDetectorLeft(pins::MD_RIGHT_PIN, PCNT_UNIT_0,
@@ -110,55 +173,93 @@ bool shoulderEncoderReady = false;
 Arm::Config makeArmConfig() {
   Arm::Config config;
   config.motorDisablePin = pins::EXTRA2_PIN;
+  config.gravityHoldEnabled = !kArmTuningEnabled;
   config.maxCartesianSpeedCmPerSec = 30.0f;
-  config.pidReenableDriftDeg = 2.5f;
+  config.pidReenableDriftDeg = 1.0f;
   // Signed PWM percentages required to counter gravity when the corresponding
   // link is horizontal. Reverse a sign if compensation assists gravity.
   config.gravityA1Percent = 0.0f;
   config.gravityA12Percent = 0.0f;
-  config.gravityA2Percent = 24.5f;
+  config.gravityA2Percent = 0.0f;
 
   config.shoulder.encoderReferenceDeg = kShoulderEncoderDegAtZero;
   config.shoulder.jointReferenceDeg = 0.0f;
   config.shoulder.direction = 1.0f;
-  // Gains are PWM percent per degree (P) and per degree/second (D).
-  config.shoulder.kP = 1.2f;
-  config.shoulder.kI = 0.2f;
-  config.shoulder.kD = 0.15f;
+  // The outer position PID outputs deg/s. The inner velocity PID converts its
+  // deg/s error to PWM percent. These are safe starting values and should be
+  // tuned on the assembled arm, velocity loop first.
+  config.shoulder.positionKp = 4.0f;
+  config.shoulder.positionKi = 0.0f;
+  config.shoulder.positionKd = 0.3f;
+  config.shoulder.velocityKp = 0.2f;
+  config.shoulder.velocityKi = 0.0f;
+  config.shoulder.velocityKd = 0.03f;
+  config.shoulder.velocityAlpha = kArmVelocityFilterAlpha;
+  config.shoulder.kVPercentPerDegPerSec = 0.15f;
+  config.shoulder.maxVelocityDegPerSec = 100.0f;
   config.shoulder.constantPidTestEnabled = false;
-
-  config.shoulder.positiveStaticFrictionPercent = 10.0f;
-  config.shoulder.negativeStaticFrictionPercent = -14.0f;
+  config.shoulder.positiveStaticFrictionPercent = 15.0f;
+  config.shoulder.negativeStaticFrictionPercent = 15.0f;
   config.shoulder.minAngleDeg = kShoulderMinAngleDeg;
   config.shoulder.maxAngleDeg = kShoulderMaxAngleDeg;
   config.shoulder.positionToleranceDeg = 1.0f;
-  config.shoulder.integralLimitDegSec = 30.0f;
-  config.shoulder.maxPwmPercent = 100.0f;
-  config.shoulder.maxOutputSlewPercentPerSec = 400.0f;
-  config.shoulder.constantPidTestEnabled = kElbowConstantPidTestEnabled;
-  config.shoulder.constantPidOutputPercent = kElbowConstantPidTestPercent;
+  config.shoulder.positionIntegralLimitDegSec = 30.0f;
+  config.shoulder.velocityIntegralLimitDeg = 30.0f;
+  config.shoulder.maxPwmPercent = 50.0f;
+  config.shoulder.maxOutputSlewPercentPerSec = 4000.0f;
+  config.shoulder.constantPidOutputPercent = 0.0f;
 
   config.elbow.encoderReferenceDeg = kElbowEncoderDegAtZero;
   config.elbow.jointReferenceDeg = 0.0f;
   config.elbow.direction = -1.0f;
-  config.elbow.kP = 0.9f;
-  config.elbow.kI = 0.1f;
-  config.elbow.kD = 0.2f;
-
-  // config.elbow.kP = 0.0f;
-  // config.elbow.kI = 0.0f;
-  // config.elbow.kD = 0.0f;
+  config.elbow.positionKp = 5.0f;
+  config.elbow.positionKi = 0.0f;
+  config.elbow.positionKd = 0.0f;
+  config.elbow.velocityKp = 0.15f;
+  config.elbow.velocityKi = 0.0f;
+  config.elbow.velocityKd = 0.01f;
+  config.elbow.velocityAlpha = kArmVelocityFilterAlpha;
+  config.elbow.kVPercentPerDegPerSec = 0.12f;
+  config.elbow.maxVelocityDegPerSec = 50.0f;
   config.elbow.constantPidTestEnabled = false;
-  config.elbow.constantPidOutputPercent = kElbowConstantPidTestPercent;
+  config.elbow.constantPidOutputPercent = 0.0f;
 
-  config.elbow.positiveStaticFrictionPercent = 4.0f;
-  config.elbow.negativeStaticFrictionPercent = 20.0f;
+  config.elbow.positiveStaticFrictionPercent = 6.0f;
+  config.elbow.negativeStaticFrictionPercent = 3.0f;
   config.elbow.minAngleDeg = kElbowMinAngleDeg;
   config.elbow.maxAngleDeg = kElbowMaxAngleDeg;
   config.elbow.positionToleranceDeg = 1.0f;
-  config.elbow.integralLimitDegSec = 30.0f;
-  config.elbow.maxPwmPercent = 100.0f;
-  config.elbow.maxOutputSlewPercentPerSec = 400.0f;
+  config.elbow.positionIntegralLimitDegSec = 30.0f;
+  config.elbow.velocityIntegralLimitDeg = 30.0f;
+  config.elbow.maxPwmPercent = 50.0f;
+  config.elbow.maxOutputSlewPercentPerSec = 4000.0f;
+
+  if (kArmStaticFrictionTuningEnabled) {
+    Arm::JointConfig &selectedJoint =
+        kTuneShoulder ? config.shoulder : config.elbow;
+    selectedJoint.constantPidTestEnabled = true;
+    selectedJoint.constantPidOutputPercent = kArmStaticFrictionManualPwmPercent;
+  } else if (kArmVelocityTuningEnabled) {
+    Arm::JointConfig &selectedJoint =
+        kTuneShoulder ? config.shoulder : config.elbow;
+    selectedJoint.manualVelocityTestEnabled = true;
+    selectedJoint.manualTargetVelocityDegPerSec =
+        kArmManualTargetVelocityDegPerSec;
+  } else if (kArmPositionTuningEnabled) {
+    Arm::JointConfig &selectedJoint =
+        kTuneShoulder ? config.shoulder : config.elbow;
+    selectedJoint.maxVelocityDegPerSec = kArmPositionTuningMaxVelocityDegPerSec;
+  }
+
+  // Optionally force the unselected motor to zero. By default it instead holds
+  // its measured startup angle using its normal cascaded controller.
+  if (kArmTuningEnabled && !kHoldOtherJointDuringTuning) {
+    if (kTuneShoulder) {
+      config.elbow.maxPwmPercent = 0.0f;
+    } else {
+      config.shoulder.maxPwmPercent = 0.0f;
+    }
+  }
 
   return config;
 }
@@ -173,8 +274,8 @@ Motor hbridge1(pwmExpander, pins::HBRIDGE5_PWM2_PIN, pins::HBRIDGE5_PWM1_PIN);
 Motor hbridge2(pwmExpander, pins::HBRIDGE6_PWM1_PIN, pins::HBRIDGE6_PWM2_PIN);
 Motor hbridge3(pwmExpander, pins::HBRIDGE1_PWM1_PIN, pins::HBRIDGE1_PWM2_PIN);
 Motor hbridge4(pwmExpander, pins::HBRIDGE2_PWM2_PIN, pins::HBRIDGE2_PWM1_PIN);
-Motor hbridge5(pwmExpander, pins::HBRIDGE3_PWM1_PIN, pins::HBRIDGE3_PWM2_PIN);
-Motor hbridge6(pwmExpander, pins::HBRIDGE4_PWM2_PIN, pins::HBRIDGE4_PWM1_PIN);
+Motor hbridge5(pwmExpander, pins::HBRIDGE4_PWM1_PIN, pins::HBRIDGE4_PWM2_PIN);
+Motor hbridge6(pwmExpander, pins::HBRIDGE3_PWM2_PIN, pins::HBRIDGE3_PWM1_PIN);
 
 MecanumDrive driveBase(hbridge1, hbridge2, hbridge3, hbridge4,
                        pins::EXTRA1_PIN);
@@ -185,13 +286,206 @@ ArmTask armTask(robotArm);
 SemaphoreHandle_t pwmMutex = nullptr;
 bool driveTaskReady = false;
 bool armTaskReady = false;
+bool armStaticFrictionTuningReady = false;
+uint32_t lastArmStaticFrictionLogMs = 0;
+bool armVelocityTuningReady = false;
+uint32_t lastArmVelocityTuningLogMs = 0;
+float armVelocityTuningStartAngleDeg = 0.0f;
+bool armPositionTuningReady = false;
+bool armPositionTuningAtStep = false;
+uint32_t nextArmPositionTuningCommandMs = 0;
+uint32_t lastArmPositionTuningLogMs = 0;
+Arm::JointAngles armPositionTuningBaseAngles;
+Arm::JointAngles armPositionTuningStepAngles;
 bool gravityCompensationReady = false;
 bool metalDetectorLeftReady = false;
 bool metalDetectorRightReady = false;
+bool cameraDetectorReady = false;
 
 bool rockHeld = false;
 
 constexpr uint32_t kGrabRockTaskStackSize = 3072;
+
+bool beginArmStaticFrictionTuning(const Arm::JointAngles &startingAngles) {
+  if (!armTask.setTargetAngles(startingAngles)) {
+    Serial.println("ARM_FRICTION setup failed: hold command rejected");
+    return false;
+  }
+
+  lastArmStaticFrictionLogMs = 0;
+  Serial.printf("ARM_FRICTION joint=%s manual=%+.1f%% plus gravity\n",
+                kTuneShoulder ? "shoulder" : "elbow",
+                kArmStaticFrictionManualPwmPercent);
+  Serial.printf("ARM_FRICTION %s holds its startup angle\n",
+                kTuneShoulder ? "elbow" : "shoulder");
+  Serial.println(
+      "ARM_FRICTION log: angle deg, velocity deg/s, outputs PWM percent");
+  return true;
+}
+
+void updateArmStaticFrictionTuning(uint32_t nowMs) {
+  if (!armStaticFrictionTuningReady ||
+      nowMs - lastArmStaticFrictionLogMs < kArmVelocityTuningLogPeriodMs) {
+    return;
+  }
+  lastArmStaticFrictionLogMs = nowMs;
+
+  Arm::Telemetry telemetry;
+  if (!armTask.getTelemetry(&telemetry)) {
+    return;
+  }
+  const Arm::JointTelemetry &joint =
+      kTuneShoulder ? telemetry.shoulder : telemetry.elbow;
+  Serial.printf("%s angle %7.2f  vel %+7.2f  manual %+6.1f  gravity %+6.1f  "
+                "pwm %+6.1f%s%s\n",
+                kTuneShoulder ? "SH" : "EL", joint.measuredPositionDeg,
+                joint.measuredVelocityDegPerSec,
+                kArmStaticFrictionManualPwmPercent, joint.gravityPercent,
+                joint.finalPwmPercent, joint.saturated ? " SAT" : "",
+                joint.slewLimited ? " SLEW" : "");
+}
+
+bool beginArmVelocityTuning(const Arm::JointAngles &startingAngles) {
+  armVelocityTuningStartAngleDeg =
+      kTuneShoulder ? startingAngles.shoulderDeg : startingAngles.elbowDeg;
+  if (!armTask.setTargetAngles(startingAngles)) {
+    Serial.println("ARM_VELOCITY setup failed: start command rejected");
+    return false;
+  }
+
+  lastArmVelocityTuningLogMs = 0;
+  Serial.printf(
+      "ARM_VELOCITY joint=%s target=%+.1f deg/s max_travel=%.1f deg\n",
+      kTuneShoulder ? "shoulder" : "elbow", kArmManualTargetVelocityDegPerSec,
+      kArmVelocityTuningMaxTravelDeg);
+  Serial.printf("ARM_VELOCITY %s holds its startup angle\n",
+                kTuneShoulder ? "elbow" : "shoulder");
+  Serial.println(
+      "ARM_VELOCITY log: velocity is measured/target; outputs are PWM percent");
+  return true;
+}
+
+void updateArmVelocityTuning(uint32_t nowMs) {
+  if (!armVelocityTuningReady) {
+    return;
+  }
+
+  if (nowMs - lastArmVelocityTuningLogMs < kArmVelocityTuningLogPeriodMs) {
+    return;
+  }
+  lastArmVelocityTuningLogMs = nowMs;
+
+  Arm::Telemetry telemetry;
+  if (!armTask.getTelemetry(&telemetry)) {
+    return;
+  }
+  const Arm::JointTelemetry &joint =
+      kTuneShoulder ? telemetry.shoulder : telemetry.elbow;
+  const Arm::JointConfig &jointConfig =
+      kTuneShoulder ? armConfig.shoulder : armConfig.elbow;
+  const float travel =
+      fabsf(joint.measuredPositionDeg - armVelocityTuningStartAngleDeg);
+  const bool nearDirectionalLimit =
+      (kArmManualTargetVelocityDegPerSec > 0.0f &&
+       joint.measuredPositionDeg >= jointConfig.maxAngleDeg - 5.0f) ||
+      (kArmManualTargetVelocityDegPerSec < 0.0f &&
+       joint.measuredPositionDeg <= jointConfig.minAngleDeg + 5.0f);
+  if (travel >= fabsf(kArmVelocityTuningMaxTravelDeg) || nearDirectionalLimit) {
+    armTask.cancel();
+    armVelocityTuningReady = false;
+    Serial.printf("ARM_VELOCITY stopped after %.1f deg of travel\n", travel);
+    return;
+  }
+
+  const float totalFeedforward = joint.velocityFeedforwardPercent +
+                                 joint.frictionPercent + joint.gravityPercent;
+  Serial.printf("%s angle %6.1f  vel %+6.1f/%+6.1f  err %+6.1f  "
+                "P/I/D %+5.1f/%+5.1f/%+5.1f  ff %+5.1f  pwm %+5.1f%s%s\n",
+                kTuneShoulder ? "SH" : "EL", joint.measuredPositionDeg,
+                joint.measuredVelocityDegPerSec, joint.targetVelocityDegPerSec,
+                joint.velocityErrorDegPerSec, joint.velocityPOutputPercent,
+                joint.velocityIOutputPercent, joint.velocityDOutputPercent,
+                totalFeedforward, joint.finalPwmPercent,
+                joint.saturated ? " SAT" : "",
+                joint.slewLimited ? " SLEW" : "");
+}
+
+bool beginArmPositionTuning(const Arm::JointAngles &startingAngles) {
+  armPositionTuningBaseAngles = startingAngles;
+  armPositionTuningStepAngles = startingAngles;
+
+  const Arm::JointConfig &jointConfig =
+      kTuneShoulder ? armConfig.shoulder : armConfig.elbow;
+  const float startingAngle =
+      kTuneShoulder ? startingAngles.shoulderDeg : startingAngles.elbowDeg;
+  float step = fabsf(kArmPositionTuningStepDeg);
+  if (startingAngle + step > jointConfig.maxAngleDeg - 5.0f) {
+    step = -step;
+  }
+  if (kTuneShoulder) {
+    armPositionTuningStepAngles.shoulderDeg += step;
+  } else {
+    armPositionTuningStepAngles.elbowDeg += step;
+  }
+
+  if (!armTask.setTargetAngles(armPositionTuningBaseAngles)) {
+    Serial.println("ARM_POSITION setup failed: hold command rejected");
+    return false;
+  }
+
+  armPositionTuningAtStep = false;
+  nextArmPositionTuningCommandMs = millis() + kArmPositionTuningInitialHoldMs;
+  lastArmPositionTuningLogMs = 0;
+  Serial.printf(
+      "ARM_POSITION joint=%s base=%.1f step=%.1f deg max_vel=%.1f deg/s\n",
+      kTuneShoulder ? "shoulder" : "elbow", startingAngle, startingAngle + step,
+      kArmPositionTuningMaxVelocityDegPerSec);
+  Serial.printf("ARM_POSITION %s holds its startup angle\n",
+                kTuneShoulder ? "elbow" : "shoulder");
+  Serial.println("ARM_POSITION log: position and velocity are measured/target");
+  return true;
+}
+
+void updateArmPositionTuning(uint32_t nowMs) {
+  if (!armPositionTuningReady) {
+    return;
+  }
+
+  if (static_cast<int32_t>(nowMs - nextArmPositionTuningCommandMs) >= 0) {
+    armPositionTuningAtStep = !armPositionTuningAtStep;
+    const Arm::JointAngles &target = armPositionTuningAtStep
+                                         ? armPositionTuningStepAngles
+                                         : armPositionTuningBaseAngles;
+    if (!armTask.setTargetAngles(target)) {
+      Serial.println("ARM_POSITION command rejected; stopping test");
+      armTask.cancel();
+      armPositionTuningReady = false;
+      return;
+    }
+    nextArmPositionTuningCommandMs = nowMs + kArmPositionTuningStepHoldMs;
+  }
+
+  if (nowMs - lastArmPositionTuningLogMs < kArmVelocityTuningLogPeriodMs) {
+    return;
+  }
+  lastArmPositionTuningLogMs = nowMs;
+
+  Arm::Telemetry telemetry;
+  if (!armTask.getTelemetry(&telemetry)) {
+    return;
+  }
+  const Arm::JointTelemetry &joint =
+      kTuneShoulder ? telemetry.shoulder : telemetry.elbow;
+  Serial.printf("%s pos %6.1f/%6.1f err %+5.1f  pos P/I/D "
+                "%+5.1f/%+5.1f/%+5.1f dps  vel %+5.1f/%+5.1f  pwm %+5.1f%s%s\n",
+                kTuneShoulder ? "SH" : "EL", joint.measuredPositionDeg,
+                joint.commandedPositionDeg, joint.positionErrorDeg,
+                joint.positionPOutputDegPerSec, joint.positionIOutputDegPerSec,
+                joint.positionDOutputDegPerSec, joint.measuredVelocityDegPerSec,
+                joint.targetVelocityDegPerSec, joint.finalPwmPercent,
+                joint.saturated ? " SAT" : "",
+                joint.slewLimited ? " SLEW" : "");
+}
 
 void logArmPositionAndRobotPose() {
   Arm::JointAngles armAngles;
@@ -261,6 +555,22 @@ bool waitForDrivePose(const OtosSensor::Pose &expectedPose,
 
 enum class TapeCalibrationAxis : uint8_t { X, Y };
 
+void readOversampledTapeCalibrationSensors(
+    float readings[kTapeCalibrationSensorCount]) {
+  uint32_t sums[kTapeCalibrationSensorCount] = {};
+  for (uint8_t sample = 0; sample < kTapeCalibrationOversampleCount; ++sample) {
+    for (uint8_t sensor = 0; sensor < kTapeCalibrationSensorCount; ++sensor) {
+      sums[sensor] +=
+          tapeSensors.readChannel(kTapeCalibrationSensorChannels[sensor]);
+    }
+  }
+
+  for (uint8_t sensor = 0; sensor < kTapeCalibrationSensorCount; ++sensor) {
+    readings[sensor] =
+        static_cast<float>(sums[sensor]) / kTapeCalibrationOversampleCount;
+  }
+}
+
 bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
                                    float knownTapeCoordinateCm,
                                    float searchDirection, float searchPower) {
@@ -294,7 +604,7 @@ bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
   const float startCrossTrackCm =
       axis == TapeCalibrationAxis::X ? startPose.yCm : startPose.xCm;
 
-  uint16_t readings[TapeSensorArray::CHANNEL_COUNT];
+  float readings[kTapeCalibrationSensorCount];
   float sampleReadings[kTapeCalibrationSensorCount][5] = {};
   float samplePoseCoordinateCm[5] = {};
   OtosSensor::Pose samplePoses[5] = {};
@@ -302,13 +612,15 @@ bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
   float centeredReading = 0.0f;
   float baselineReading = 0.0f;
   float peakReading = 0.0f;
-  float peakPoseCoordinateCm = 0.0f;
+  float peakMiddleSensorCoordinateCm = 0.0f;
   static float profileReadings[kTapeCalibrationSensorCount]
                               [kTapeCalibrationMaxProfileSamples];
-  static float profileCoordinatesCm[kTapeCalibrationMaxProfileSamples];
+  static float profileCoordinatesCm[kTapeCalibrationSensorCount]
+                                   [kTapeCalibrationMaxProfileSamples];
+  static uint16_t baselineHistogram[TapeSensorArray::MAX_READING + 1];
+  memset(baselineHistogram, 0, sizeof(baselineHistogram));
+  uint16_t baselineSampleCount = 0;
   uint16_t profileCount = 0;
-  uint16_t peakProfileIndex = 0;
-  bool baselineValid = false;
   bool significantRiseDetected = false;
   bool peakPoseValid = false;
   bool peakConfirmed = false;
@@ -336,7 +648,7 @@ bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
 
   uint32_t searchStartMs = millis();
   while (millis() - searchStartMs < kTapeCalibrationTimeoutMs) {
-    tapeSensors.readAll(readings);
+    readOversampledTapeCalibrationSensors(readings);
     OtosSensor::Pose samplePose;
     if (!driveTask.getCurrentPose(&samplePose)) {
       delay(1);
@@ -345,8 +657,7 @@ bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
 
     if (sampleCount < 5) {
       for (uint8_t sensor = 0; sensor < kTapeCalibrationSensorCount; ++sensor) {
-        sampleReadings[sensor][sampleCount] =
-            readings[kTapeCalibrationSensorChannels[sensor]];
+        sampleReadings[sensor][sampleCount] = readings[sensor];
       }
       samplePoseCoordinateCm[sampleCount] =
           axis == TapeCalibrationAxis::X ? samplePose.xCm : samplePose.yCm;
@@ -362,8 +673,7 @@ bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
         samplePoses[i] = samplePoses[i + 1];
       }
       for (uint8_t sensor = 0; sensor < kTapeCalibrationSensorCount; ++sensor) {
-        sampleReadings[sensor][4] =
-            readings[kTapeCalibrationSensorChannels[sensor]];
+        sampleReadings[sensor][4] = readings[sensor];
       }
       samplePoseCoordinateCm[4] =
           axis == TapeCalibrationAxis::X ? samplePose.xCm : samplePose.yCm;
@@ -398,6 +708,24 @@ bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
 
     const OtosSensor::Pose &centeredPose = samplePoses[2];
     const float centeredCoordinateCm = samplePoseCoordinateCm[2];
+    const float sampleHeadingRad = centeredPose.headingDeg * DEG_TO_RAD;
+    const float cosSampleHeading = cosf(sampleHeadingRad);
+    const float sinSampleHeading = sinf(sampleHeadingRad);
+    float sensorCoordinatesCm[kTapeCalibrationSensorCount];
+    for (uint8_t sensor = 0; sensor < kTapeCalibrationSensorCount; ++sensor) {
+      const float sensorLocalXCm = kTapeCalibrationSensorLocalXCm[sensor];
+      const float sensorWorldOffsetXCm =
+          (cosSampleHeading * sensorLocalXCm) -
+          (sinSampleHeading * kTapeCalibrationSensorLocalYCm);
+      const float sensorWorldOffsetYCm =
+          (sinSampleHeading * sensorLocalXCm) +
+          (cosSampleHeading * kTapeCalibrationSensorLocalYCm);
+      const float sensorAxisOffsetCm = axis == TapeCalibrationAxis::X
+                                           ? sensorWorldOffsetXCm
+                                           : sensorWorldOffsetYCm;
+      sensorCoordinatesCm[sensor] = centeredCoordinateCm + sensorAxisOffsetCm;
+    }
+    const float middleSensorCoordinateCm = sensorCoordinatesCm[1];
     const float centeredCrossTrackCm =
         axis == TapeCalibrationAxis::X ? centeredPose.yCm : centeredPose.xCm;
     float headingDriftDeg = centeredPose.headingDeg - startPose.headingDeg;
@@ -414,7 +742,7 @@ bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
     // Process samples at fixed spatial intervals so detection does not depend
     // on loop rate, OTOS update rate, or small changes in crossing speed.
     if (profileCount > 0 &&
-        (centeredCoordinateCm - profileCoordinatesCm[profileCount - 1]) *
+        (middleSensorCoordinateCm - profileCoordinatesCm[1][profileCount - 1]) *
                 searchDirection <
             kTapeCalibrationProfileSpacingCm) {
       if (!driveTask.isBusy()) {
@@ -429,20 +757,25 @@ bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
     }
     for (uint8_t sensor = 0; sensor < kTapeCalibrationSensorCount; ++sensor) {
       profileReadings[sensor][profileCount] = centeredReadings[sensor];
+      // Store the sensor's physical world-axis coordinate at this sample.
+      // Using the measured heading here accounts for small heading changes
+      // during the scan instead of rotating every sample by the start heading.
+      profileCoordinatesCm[sensor][profileCount] = sensorCoordinatesCm[sensor];
     }
-    profileCoordinatesCm[profileCount] = centeredCoordinateCm;
-    const uint16_t currentProfileIndex = profileCount++;
+    ++profileCount;
 
     if (!significantRiseDetected) {
-      if (!baselineValid) {
-        baselineReading = centeredReading;
-        baselineValid = true;
-      } else {
-        // Until the tape is encountered, retain the lowest stable background
-        // value. The five-sample median prevents a single low ADC spike from
-        // artificially lowering this reference.
-        baselineReading = fminf(baselineReading, centeredReading);
-      }
+      const uint16_t readingIndex = static_cast<uint16_t>(
+          fminf(centeredReading, TapeSensorArray::MAX_READING) + 0.5f);
+      ++baselineHistogram[readingIndex];
+      ++baselineSampleCount;
+      // This spatial lower quartile is calculated from readings that have
+      // already passed through the five-sample temporal median. A few samples
+      // from the beginning of the tape therefore cannot pull the background
+      // upward, and an isolated low value cannot pull it downward.
+      baselineReading =
+          tapeReadingPercentile(baselineHistogram, baselineSampleCount,
+                                kTapeCalibrationBaselinePercentile);
 
       if (centeredReading - baselineReading >= kTapeCalibrationMinPeakRise) {
         if (riseCount < kTapeCalibrationRiseConfirmSamples) {
@@ -455,8 +788,7 @@ bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
       if (riseCount >= kTapeCalibrationRiseConfirmSamples) {
         significantRiseDetected = true;
         peakReading = centeredReading;
-        peakPoseCoordinateCm = centeredCoordinateCm;
-        peakProfileIndex = currentProfileIndex;
+        peakMiddleSensorCoordinateCm = middleSensorCoordinateCm;
         peakPoseValid = true;
         peakDropCount = 0;
         Serial.printf("Tape rise detected: baseline=%.1f reading=%.1f\n",
@@ -465,8 +797,7 @@ bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
     } else {
       if (centeredReading > peakReading) {
         peakReading = centeredReading;
-        peakPoseCoordinateCm = centeredCoordinateCm;
-        peakProfileIndex = currentProfileIndex;
+        peakMiddleSensorCoordinateCm = middleSensorCoordinateCm;
         peakPoseValid = true;
         peakDropCount = 0;
       }
@@ -474,7 +805,8 @@ bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
 
     if (peakPoseValid) {
       const float travelPastPeakCm =
-          (centeredCoordinateCm - peakPoseCoordinateCm) * searchDirection;
+          (middleSensorCoordinateCm - peakMiddleSensorCoordinateCm) *
+          searchDirection;
       const bool sufficientlyPastPeak =
           travelPastPeakCm >= kTapeCalibrationMinTravelPastPeakCm;
       const float currentHalfHeight =
@@ -515,16 +847,22 @@ bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
     return false;
   }
 
-  const float headingRad = startPose.headingDeg * DEG_TO_RAD;
-  float measuredTapeCenterSumCm = 0.0f;
+  float measuredTapeCentersCm[kTapeCalibrationSensorCount] = {};
   uint8_t validSensorCount = 0;
 
   for (uint8_t sensor = 0; sensor < kTapeCalibrationSensorCount; ++sensor) {
-    float sensorBaseline = profileReadings[sensor][0];
+    memset(baselineHistogram, 0, sizeof(baselineHistogram));
+    for (uint16_t i = 0; i < profileCount; ++i) {
+      const uint16_t readingIndex = static_cast<uint16_t>(
+          fminf(profileReadings[sensor][i], TapeSensorArray::MAX_READING) +
+          0.5f);
+      ++baselineHistogram[readingIndex];
+    }
+    const float sensorBaseline = tapeReadingPercentile(
+        baselineHistogram, profileCount, kTapeCalibrationBaselinePercentile);
     float sensorPeak = profileReadings[sensor][0];
     uint16_t sensorPeakIndex = 0;
     for (uint16_t i = 1; i < profileCount; ++i) {
-      sensorBaseline = fminf(sensorBaseline, profileReadings[sensor][i]);
       if (profileReadings[sensor][i] > sensorPeak) {
         sensorPeak = profileReadings[sensor][i];
         sensorPeakIndex = i;
@@ -553,8 +891,9 @@ bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
         const float fraction = (edgeReading - previousReading) /
                                (currentReading - previousReading);
         risingEdgeCoordinateCm =
-            profileCoordinatesCm[i - 1] +
-            fraction * (profileCoordinatesCm[i] - profileCoordinatesCm[i - 1]);
+            profileCoordinatesCm[sensor][i - 1] +
+            fraction * (profileCoordinatesCm[sensor][i] -
+                        profileCoordinatesCm[sensor][i - 1]);
         risingEdgeValid = true;
       }
     }
@@ -567,8 +906,9 @@ bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
         const float fraction = (edgeReading - previousReading) /
                                (currentReading - previousReading);
         fallingEdgeCoordinateCm =
-            profileCoordinatesCm[i - 1] +
-            fraction * (profileCoordinatesCm[i] - profileCoordinatesCm[i - 1]);
+            profileCoordinatesCm[sensor][i - 1] +
+            fraction * (profileCoordinatesCm[sensor][i] -
+                        profileCoordinatesCm[sensor][i - 1]);
         fallingEdgeValid = true;
         break;
       }
@@ -582,35 +922,44 @@ bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
 
     const float sensorMeasuredCenterCm =
         0.5f * (risingEdgeCoordinateCm + fallingEdgeCoordinateCm);
-    // Rotate each sensor's lateral X offset and the tape array's common
-    // forward Y offset into the world axis being calibrated.
-    const float sensorLocalXCm = kTapeCalibrationSensorLocalXCm[sensor];
-    const float sensorWorldOffsetXCm =
-        (cosf(headingRad) * sensorLocalXCm) -
-        (sinf(headingRad) * kTapeCalibrationSensorLocalYCm);
-    const float sensorWorldOffsetYCm =
-        (sinf(headingRad) * sensorLocalXCm) +
-        (cosf(headingRad) * kTapeCalibrationSensorLocalYCm);
-    const float sensorAxisOffsetCm = axis == TapeCalibrationAxis::X
-                                         ? sensorWorldOffsetXCm
-                                         : sensorWorldOffsetYCm;
-    const float robotCenterEquivalentCm =
-        sensorMeasuredCenterCm + sensorAxisOffsetCm;
-    measuredTapeCenterSumCm += robotCenterEquivalentCm;
-    ++validSensorCount;
+    measuredTapeCentersCm[validSensorCount++] = sensorMeasuredCenterCm;
 
-    Serial.printf("Tape ch%u: base=%.1f peak=%.1f edges=(%.2f,%.2f) "
-                  "offset=%.2f center=%.2f\n",
+    Serial.printf("Tape ch%u: base=%.1f peak=%.1f world_edges=(%.2f,%.2f) "
+                  "center=%.2f\n",
                   kTapeCalibrationSensorChannels[sensor], sensorBaseline,
                   sensorPeak, risingEdgeCoordinateCm, fallingEdgeCoordinateCm,
-                  sensorAxisOffsetCm, robotCenterEquivalentCm);
+                  sensorMeasuredCenterCm);
   }
 
-  if (validSensorCount == 0) {
-    Serial.println("Tape calibration failed: no sensor produced both edges");
+  if (validSensorCount != kTapeCalibrationSensorCount) {
+    Serial.printf(
+        "Tape calibration failed: only %u of %u sensors produced both edges\n",
+        validSensorCount, kTapeCalibrationSensorCount);
     return false;
   }
-  const float measuredTapeCenterCm = measuredTapeCenterSumCm / validSensorCount;
+
+  // Use the median of the three independently corrected sensor estimates so
+  // one mislocated edge or noisy sensor cannot pull the calibrated pose away
+  // from the other two.
+  if (measuredTapeCentersCm[0] > measuredTapeCentersCm[1]) {
+    const float value = measuredTapeCentersCm[0];
+    measuredTapeCentersCm[0] = measuredTapeCentersCm[1];
+    measuredTapeCentersCm[1] = value;
+  }
+  if (measuredTapeCentersCm[1] > measuredTapeCentersCm[2]) {
+    const float value = measuredTapeCentersCm[1];
+    measuredTapeCentersCm[1] = measuredTapeCentersCm[2];
+    measuredTapeCentersCm[2] = value;
+  }
+  if (measuredTapeCentersCm[0] > measuredTapeCentersCm[1]) {
+    const float value = measuredTapeCentersCm[0];
+    measuredTapeCentersCm[0] = measuredTapeCentersCm[1];
+    measuredTapeCentersCm[1] = value;
+  }
+  const float measuredTapeCenterCm = measuredTapeCentersCm[1];
+  Serial.printf("Tape center median: %.2f cm (%.2f, %.2f, %.2f)\n",
+                measuredTapeCenterCm, measuredTapeCentersCm[0],
+                measuredTapeCentersCm[1], measuredTapeCentersCm[2]);
 
   // The robot is now slightly beyond the tape because a peak can only be
   // confirmed after the reading falls. Shift the current pose by the error at
@@ -654,22 +1003,40 @@ bool calibrateYWithMiddleTapeSensor(float knownTapeYCm, float searchDirection,
 
 void stowGrabbedRock() {
   armTask.waitUntilSettled(1000);
-  armTask.setTargetPosition({11.0f, 13.0f}, true);
+  armTask.setTargetPosition({11.0f, 17.0f}, true);
   armTask.waitUntilSettled(1500);
-  armTask.setTargetPosition({8.5f, 1.1f}, true);
+  armTask.setTargetPosition({8.5f, 2.5f}, true);
   armTask.waitUntilSettled(1000);
   servo1.setAngle(clawOpenAngle);
+  delay(500);
   armTask.setTargetPosition({10.80f, 13.0f}, true);
   armTask.waitUntilSettled(1000);
   armTask.setTargetPosition({24, 3}, true);
 }
 
 void grabRock() {
-  armTask.setTargetPosition({28.0f, -4.5f}, true);
+  OtosSensor::Pose currentPose;
+  if (driveTask.getCurrentPose(&currentPose)) {
+    constexpr float kGrabApproachDistanceCm = 2.0f;
+    const float headingRad = currentPose.headingDeg * DEG_TO_RAD;
+    const OtosSensor::Pose approachPose{
+        currentPose.xCm - (kGrabApproachDistanceCm * sinf(headingRad)),
+        currentPose.yCm + (kGrabApproachDistanceCm * cosf(headingRad)),
+        currentPose.headingDeg};
+    if (driveTask.setTargetPose(approachPose, 0.25f)) {
+      driveTask.waitUntilMotionFinished(3000);
+    } else {
+      Serial.println("Could not queue grab approach");
+    }
+  } else {
+    Serial.println("Could not get pose for grab approach");
+  }
+
+  armTask.setTargetPosition({29.5f, -2.5f}, true);
   armTask.waitUntilSettled(1000);
   servo1.setAngle(clawClosedAngle);
   delay(500);
-  armTask.setTargetPosition({28.0f, 16.0f}, true);
+  armTask.setTargetPosition({29.5f, 17.0f}, true);
   delay(500);
   // The rock is secured before the asynchronous stowing motion begins. This
   // also prevents the path logic from starting another grab while it runs.
@@ -689,6 +1056,7 @@ void grabRock() {
 }
 
 void runPath() {
+  bool lastRockMetalDetected = false;
   // delay(2000);
   // Print the three installed tape sensors continuously for diagnostics.
 
@@ -713,20 +1081,35 @@ void runPath() {
 
   driveTask.setTargetPose({-4.5f, 95.0f, 0.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
+
   if (!rockHeld) {
     driveTask.calibrateImuBlocking(750);
-    if (confirmedMetalDetected(metalDetectorRight)) {
-      servo1.setAngle(clawOpenAngle);
-      driveTask.setTargetPose({-7, 68.5, -43.0f}, 1.0f, true);
-      driveTask.waitUntilMotionFinished(10000);
-      driveTask.setTargetPose({2.5, 77, -40.0f}, 0.25f);
-      driveTask.waitUntilMotionFinished(10000);
-      grabRock();
-      delay(500);
-      driveTask.setTargetPose({0, 80, 0.0f}, 1.0f);
-      driveTask.waitUntilMotionFinished(10000);
-    }
+    lastRockMetalDetected = confirmedMetalDetected(metalDetectorRight);
   }
+  driveTask.setTargetPose({-10.0f, 95.0f, 0.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-10.0f, 100.0f, 90.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  delay(1000);
+  // detect telletubby
+  driveTask.setTargetPose({-10.0f, 90.0f, 90.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  delay(1000);
+
+  if (lastRockMetalDetected) {
+    driveTask.setTargetPose({-10.0f, 90.0f, -90.0f}, 1.0f);
+    armTask.setTargetPosition({29.5f, 5.0f}, true);
+    driveTask.waitUntilMotionFinished(10000);
+    servo1.setAngle(clawOpenAngle);
+    driveTask.setTargetPose({-7, 95, -90.0f}, 1.0f, true);
+    driveTask.waitUntilMotionFinished(10000);
+    armTask.setTargetPosition({29.5f, -2.5f}, true);
+    driveTask.setTargetPose({1.0, 95, -90.0f}, 0.25f);
+    driveTask.waitUntilMotionFinished(10000);
+    grabRock();
+    delay(250);
+  }
+  lastRockMetalDetected = false;
 
   driveTask.setTargetPose({-2.0f, 116.0f, 0.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(10000);
@@ -736,6 +1119,7 @@ void runPath() {
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({-7.5f, 169.0f, 61.5f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
+  /*
 
   if (!rockHeld) {
     driveTask.calibrateImuBlocking(750);
@@ -761,7 +1145,7 @@ void runPath() {
       driveTask.waitUntilMotionFinished(10000);
       driveTask.setTargetPose({-28, 194, -90.0f}, 1.0f);
       driveTask.waitUntilMotionFinished(10000);
-      driveTask.setTargetPose({-19, 194, -90.0f}, 0.25f);
+      driveTask.setTargetPose({-18, 194, -90.0f}, 0.25f);
       driveTask.waitUntilMotionFinished(10000);
       delay(500);
       grabRock();
@@ -800,11 +1184,11 @@ void runPath() {
     if (confirmedMetalDetected(metalDetectorLeft)) {
       servo1.setAngle(clawOpenAngle);
       delay(250);
-      driveTask.setTargetPose({-74.5f, 22.0f, 147.0f}, 1.0f);
+      driveTask.setTargetPose({-73.0f, 22.0f, 147.0f}, 1.0f);
       driveTask.waitUntilMotionFinished(10000);
       driveTask.setTargetPose({-74.5f, 20.0f, -140.0f}, 1.0f);
       driveTask.waitUntilMotionFinished(10000);
-      driveTask.setTargetPose({-67.0f, 11.0f, -140.0f}, 0.25f);
+      driveTask.setTargetPose({-65.5f, 11.0f, -140.0f}, 0.25f);
       driveTask.waitUntilMotionFinished(10000);
       delay(250);
       grabRock();
@@ -817,7 +1201,7 @@ void runPath() {
   } else {
     driveTask.setTargetPose({-67, 21.5, 78}, 1.0);
     driveTask.waitUntilMotionFinished(10000);
-    driveTask.setTargetPose({-77.8, 19.2, 78}, 0.25);
+    driveTask.setTargetPose({-78.5, 19.2, 78}, 0.25);
     driveTask.waitUntilMotionFinished(10000);
     delay(250);
     grabRock();
@@ -875,7 +1259,7 @@ void runPath() {
   // Calibrate X when the centered middle tape sensor is over the known
   // line.
 
-  while (!calibrateXWithMiddleTapeSensor(-151.7f, -1.0f, 0.07f)) {
+  while (!calibrateXWithMiddleTapeSensor(-151.7f, -1.0f, 0.08f)) {
     driveTask.setTargetPose({-137.5f, 160.5f, 0.0f}, 0.3f);
     driveTask.waitUntilMotionFinished(10000);
   }
@@ -1077,11 +1461,11 @@ void runPath() {
   delay(500);
   armTask.setTargetPosition({25.5, 6.0}, true);
   servo1.setAngle(clawOpenAngle);
-  driveTask.setTargetPose({-144.0f, 94.0f, -90.0f}, 1.0f);
+  driveTask.setTargetPose({-144.0f, 96.0f, -90.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-128.0f, 94.0f, -90.0f}, 0.1f);
+  driveTask.setTargetPose({-128.0f, 96.0f, -90.0f}, 0.1f);
   driveTask.waitUntilMotionFinished(3000);
-  armTask.setTargetPosition({25.5, 5.75}, true);
+  armTask.setTargetPosition({27.0, 5.75}, true);
   armTask.waitUntilSettled(1000);
   servo1.setAngle(clawFullyClosedAngle);
   delay(1000);
@@ -1140,6 +1524,8 @@ void runPath() {
 
 void setup() {
   Serial.begin(kSerialBaud);
+  cameraDetectorReady =
+      cameraDetector.begin(pins::CAMERA_RX_PIN, pins::CAMERA_TX_PIN);
   const bool servo1Ready = servo1.begin(115.0f);
   driveBase.begin();
   const bool tapeReady = tapeSensors.begin();
@@ -1155,11 +1541,16 @@ void setup() {
   //
   const bool pwmReady = pwmExpander.begin(pins::PWM_EXPANDER_SDA_PIN,
                                           pins::PWM_EXPANDER_SCL_PIN, 50.0f);
+  pwmExpander.enableVoltageNormalization(pins::BATTERY_VOLTAGE_PIN,
+                                         kBatteryVoltageDividerRatio,
+                                         kNormalizedMotorVoltage);
   elbowEncoderReady = elbowEncoder.begin();
   shoulderEncoderReady = shoulderEncoder.begin();
   const bool encoderMuxReady = elbowEncoder.muxIsConnected();
   const bool otosReady = otosSensor.ping();
   Serial.println("PCA9685 " + String(pwmReady ? "ready" : "not found"));
+  Serial.printf("Battery: %.2f V (PWM normalized to %.1f V)\n",
+                pwmExpander.supplyVoltage(), kNormalizedMotorVoltage);
   Serial.println("Servo 1 " +
                  String(servo1Ready ? "ready at 90 degrees" : "not started"));
   Serial.println("TCA9548 encoder mux " +
@@ -1179,6 +1570,8 @@ void setup() {
                                                        : "missing"));
   }
   Serial.println("OTOS sensor " + String(otosReady ? "ready" : "not found"));
+  Serial.println("Camera detector " +
+                 String(cameraDetectorReady ? "ready" : "not started"));
   Serial.println("MCP3008 " + String(tapeReady ? "ready" : "not found"));
   Serial.println("Metal detector left " +
                  String(metalDetectorLeftReady ? "ready" : "not started"));
@@ -1196,7 +1589,6 @@ void setup() {
   Arm::JointAngles currentArmAngles;
   const bool armAnglesReady = shoulderEncoderReady && elbowEncoderReady &&
                               robotArm.readAngles(&currentArmAngles);
-
   pwmMutex = xSemaphoreCreateMutex();
   driveTaskReady =
       pwmReady && otosReady && initialPoseSet && driveTask.begin(pwmMutex);
@@ -1212,7 +1604,8 @@ void setup() {
     // gravityCompensationReady =
     //     gravityCompensationConfigured && armTask.setTargetAngles({90, 90});
     // Serial.println("Gravity compensation " +
-    //                String(gravityCompensationReady ? "ready" : "not ready"));
+    //                String(gravityCompensationReady ? "ready" : "not
+    //                ready"));
 
     // Joint-angle commands return immediately and execute in the arm task:
     // while (true) {
@@ -1224,6 +1617,24 @@ void setup() {
     // Once zero offsets, motor directions, and link lengths are calibrated,
     // command an XY target in centimeters from the shoulder joint like this:
     // armTask.setTargetPosition({20.0f, 15.0f}, true);
+  }
+
+  if (kArmTuningEnabled) {
+    if (armTaskReady) {
+      if (kArmStaticFrictionTuningEnabled) {
+        armStaticFrictionTuningReady =
+            beginArmStaticFrictionTuning(currentArmAngles);
+      } else if (kArmVelocityTuningEnabled) {
+        armVelocityTuningReady = beginArmVelocityTuning(currentArmAngles);
+      } else if (kArmPositionTuningEnabled) {
+        armPositionTuningReady = beginArmPositionTuning(currentArmAngles);
+      }
+    } else {
+      Serial.println("ARM_TUNE unavailable: arm task did not start");
+    }
+    // Do not calibrate the drive, issue Cartesian arm commands, or run the
+    // autonomous path while the tuning harness owns the arm.
+    return;
   }
 
   // Reset the OTOS coordinate system through its owning task:
@@ -1255,7 +1666,9 @@ void setup() {
   // servo1.disable();
   // armTask.setTargetAngles({90.0f, -90.0f});
   servo1.setAngle(clawOpenAngle);
-  armTask.setTargetPosition({28.0f, -4.5f}, true);
+  armTask.setTargetPosition({20, 6}, true);
+  // delay(3000);
+  // grabRock();
   // armTask.waitUntilSettled(1500);
   // grabRock();
   // servo1.setAngle(130);
@@ -1270,6 +1683,7 @@ void setup() {
   // armTask.setTargetPosition({10.80f, 13.0f}, true);
 
   runPath();
+
   // delay(2000);
   // Serial.printf("calibrating X with middle tape sensor\n");
   // calibrateXWithMiddleTapeSensor(0.0f, -1.0f, 0.05f);
@@ -1322,6 +1736,17 @@ void setup() {
 void loop() {
   static uint32_t lastArmLogMs = 0;
   const uint32_t nowMs = millis();
+  if (kArmTuningEnabled) {
+    if (kArmStaticFrictionTuningEnabled) {
+      updateArmStaticFrictionTuning(nowMs);
+    } else if (kArmVelocityTuningEnabled) {
+      updateArmVelocityTuning(nowMs);
+    } else if (kArmPositionTuningEnabled) {
+      updateArmPositionTuning(nowMs);
+    }
+    delay(1);
+    return;
+  }
   if (armTaskReady && nowMs - lastArmLogMs >= 100) {
     lastArmLogMs = nowMs;
     logArmPositionAndRobotPose();
@@ -1347,7 +1772,8 @@ void loop() {
   //   char detectorRightBaseline[16];
 
   //   if (detectorLeftValid) {
-  //     snprintf(detectorLeftFrequency, sizeof(detectorLeftFrequency), "%.1f",
+  //     snprintf(detectorLeftFrequency, sizeof(detectorLeftFrequency),
+  //     "%.1f",
   //              detectorLeftReading.frequencyHz);
   //     snprintf(detectorLeftBaseline, sizeof(detectorLeftBaseline), "%.1f",
   //              detectorLeftReading.baselineHz);
@@ -1360,11 +1786,13 @@ void loop() {
   //     snprintf(detectorRightFrequency, sizeof(detectorRightFrequency),
   //     "%.1f",
   //              detectorRightReading.frequencyHz);
-  //     snprintf(detectorRightBaseline, sizeof(detectorRightBaseline), "%.1f",
+  //     snprintf(detectorRightBaseline, sizeof(detectorRightBaseline),
+  //     "%.1f",
   //              detectorRightReading.baselineHz);
   //   } else {
-  //     snprintf(detectorRightFrequency, sizeof(detectorRightFrequency), "--");
-  //     snprintf(detectorRightBaseline, sizeof(detectorRightBaseline), "--");
+  //     snprintf(detectorRightFrequency, sizeof(detectorRightFrequency),
+  //     "--"); snprintf(detectorRightBaseline, sizeof(detectorRightBaseline),
+  //     "--");
   //   }
 
   //   const char *detectorLeftState = !detectorLeftValid ? "OFFLINE"
@@ -1375,10 +1803,12 @@ void loop() {
   //                                "METAL"
   //                                                                  : "OK";
   //   const char *detectorRightState = !detectorRightValid ? "OFFLINE"
-  //                                    : detectorRightReading.counterSaturated
+  //                                    :
+  //                                    detectorRightReading.counterSaturated
   //                                    ? "OVERFLOW"
-  //                                    : !detectorRightReading.baselineReady ?
-  //                                    "CAL" : detectorRightReading.anomaly ?
+  //                                    : !detectorRightReading.baselineReady
+  //                                    ? "CAL" : detectorRightReading.anomaly
+  //                                    ?
   //                                "METAL"
   //                                                                  : "OK";
 

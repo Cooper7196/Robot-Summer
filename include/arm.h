@@ -21,24 +21,37 @@ public:
     Position(float xCm = 0.0f, float yCm = 0.0f) : xCm(xCm), yCm(yCm) {}
   };
 
-  // Controller gains use degrees and seconds. Outputs are signed PWM percent.
+  // Cascaded controller gains use degrees and seconds. The position PID
+  // produces a velocity target; the velocity PID produces signed PWM percent.
   struct JointConfig {
     float encoderReferenceDeg;
     float jointReferenceDeg;
     float direction;
     float minAngleDeg;
     float maxAngleDeg;
-    float kP;
-    float kI;
-    float kD;
+    float positionKp;
+    float positionKi;
+    float positionKd;
+    float velocityKp;
+    float velocityKi;
+    float velocityKd;
+    float maxVelocityDegPerSec;
+    // Tuning-only override that bypasses the outer position loop while keeping
+    // the velocity PID and all motor feedforward terms active.
+    bool manualVelocityTestEnabled;
+    float manualTargetVelocityDegPerSec;
     bool constantPidTestEnabled;
     float constantPidOutputPercent;
     float velocityAlpha;
+    // Motor feedforward: kV * target velocity plus directional kS.
+    float kVPercentPerDegPerSec;
     float positiveStaticFrictionPercent;
     float negativeStaticFrictionPercent;
     float positionToleranceDeg;
-    float integralZoneDeg;
-    float integralLimitDegSec;
+    float positionIntegralZoneDeg;
+    float positionIntegralLimitDegSec;
+    float velocityIntegralZoneDegPerSec;
+    float velocityIntegralLimitDeg;
     float integralDecay;
     float maxPwmPercent;
     float maxOutputSlewPercentPerSec;
@@ -57,6 +70,7 @@ public:
     int8_t motorDisablePin;
     // Once both joints remain within tolerance and below this velocity for the
     // settle time, disable feedback and retain gravity compensation only.
+    bool gravityHoldEnabled;
     uint32_t gravityHoldSettleTimeMs;
     float gravityHoldMaxVelocityDegPerSec;
     // Re-enable PID if either joint moves this far from its settled angle.
@@ -76,12 +90,19 @@ public:
     float measuredPositionDeg;
     float measuredVelocityDegPerSec;
     float positionErrorDeg;
-    float pOutputPercent;
-    float dOutputPercent;
+    float trajectoryVelocityDegPerSec;
+    float targetVelocityDegPerSec;
+    float velocityErrorDegPerSec;
+    float positionPOutputDegPerSec;
+    float positionIOutputDegPerSec;
+    float positionDOutputDegPerSec;
+    float velocityPOutputPercent;
+    float velocityIOutputPercent;
+    float velocityDOutputPercent;
+    float velocityFeedforwardPercent;
     float frictionPercent;
     float gravityPercent;
-    float integralOutputPercent;
-    float pidOutputPercent;
+    float velocityPidOutputPercent;
     float unclampedOutputPercent;
     float finalPwmPercent;
     bool saturated;
@@ -129,11 +150,15 @@ private:
     float previousCommandedPositionDeg;
     float velocityDegPerSec;
     float commandedVelocityDegPerSec;
-    float integralDegSec;
+    float previousVelocityErrorDegPerSec;
+    float positionIntegralDegSec;
+    float velocityIntegralDeg;
     float outputPercent;
     bool encoderInitialized;
     bool controllerInitialized;
     bool commandInitialized;
+    bool velocityErrorInitialized;
+    bool positionOutputSaturated;
     bool outputSaturated;
 
     JointState();

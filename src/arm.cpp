@@ -8,12 +8,18 @@ constexpr float kDefaultIntegralZoneDeg = 7.5f;
 
 Arm::JointConfig::JointConfig()
     : encoderReferenceDeg(0.0f), jointReferenceDeg(0.0f), direction(1.0f),
-      minAngleDeg(-180.0f), maxAngleDeg(180.0f), kP(5.0f), kI(0.0f), kD(0.0f),
+      minAngleDeg(-180.0f), maxAngleDeg(180.0f), positionKp(5.0f),
+      positionKi(0.0f), positionKd(0.0f), velocityKp(0.2f),
+      velocityKi(0.0f), velocityKd(0.0f), maxVelocityDegPerSec(180.0f),
+      manualVelocityTestEnabled(false), manualTargetVelocityDegPerSec(0.0f),
       constantPidTestEnabled(false), constantPidOutputPercent(0.0f),
-      velocityAlpha(0.15f), positiveStaticFrictionPercent(0.0f),
+      velocityAlpha(0.15f), kVPercentPerDegPerSec(0.0f),
+      positiveStaticFrictionPercent(0.0f),
       negativeStaticFrictionPercent(0.0f),
       positionToleranceDeg(kDefaultToleranceDeg),
-      integralZoneDeg(kDefaultIntegralZoneDeg), integralLimitDegSec(5.0f),
+      positionIntegralZoneDeg(kDefaultIntegralZoneDeg),
+      positionIntegralLimitDegSec(5.0f),
+      velocityIntegralZoneDegPerSec(30.0f), velocityIntegralLimitDeg(30.0f),
       integralDecay(0.95f), maxPwmPercent(60.0f),
       maxOutputSlewPercentPerSec(200.0f) {}
 
@@ -21,7 +27,8 @@ Arm::Config::Config()
     : shoulderLinkCm(19.0f), elbowLinkCm(23.8675f),
       maxCartesianSpeedCmPerSec(10.0f), updatePeriodUs(4000),
       maxLoopDelayUs(50000), latchFaults(false), motorDisablePin(-1),
-      gravityHoldSettleTimeMs(250), gravityHoldMaxVelocityDegPerSec(2.0f),
+      gravityHoldEnabled(true), gravityHoldSettleTimeMs(250),
+      gravityHoldMaxVelocityDegPerSec(2.0f),
       pidReenableDriftDeg(2.5f),
       gravityA1Percent(0.0f), gravityA12Percent(0.0f), gravityA2Percent(0.0f),
       shoulder(), elbow() {}
@@ -30,8 +37,11 @@ Arm::JointState::JointState()
     : positionDeg(0.0f), previousPositionDeg(0.0f),
       previousWrappedPositionDeg(0.0f), previousCommandedPositionDeg(0.0f),
       velocityDegPerSec(0.0f), commandedVelocityDegPerSec(0.0f),
-      integralDegSec(0.0f), outputPercent(0.0f), encoderInitialized(false),
-      controllerInitialized(false), commandInitialized(false),
+      previousVelocityErrorDegPerSec(0.0f), positionIntegralDegSec(0.0f),
+      velocityIntegralDeg(0.0f), outputPercent(0.0f),
+      encoderInitialized(false), controllerInitialized(false),
+      commandInitialized(false), velocityErrorInitialized(false),
+      positionOutputSaturated(false),
       outputSaturated(false) {}
 
 Arm::Arm(Motor &shoulderMotor, Motor &elbowMotor,
@@ -221,7 +231,13 @@ bool Arm::update() {
           fabsf(config_.gravityHoldMaxVelocityDegPerSec) &&
       fabsf(telemetry_.elbow.measuredVelocityDegPerSec) <=
           fabsf(config_.gravityHoldMaxVelocityDegPerSec);
-  if (!gravityHoldActive_) {
+  const bool controllerTestActive =
+      config_.shoulder.constantPidTestEnabled ||
+      config_.elbow.constantPidTestEnabled ||
+      config_.shoulder.manualVelocityTestEnabled ||
+      config_.elbow.manualVelocityTestEnabled;
+  if (!gravityHoldActive_ && !controllerTestActive &&
+      config_.gravityHoldEnabled) {
     if (atTarget_ && velocitySettled) {
       if (gravityHoldSettledSinceUs_ == 0) {
         gravityHoldSettledSinceUs_ = nowUs;
@@ -311,17 +327,25 @@ bool Arm::faulted() const { return faulted_; }
 void Arm::resetPid() {
   shoulderState_.velocityDegPerSec = 0.0f;
   shoulderState_.commandedVelocityDegPerSec = 0.0f;
-  shoulderState_.integralDegSec = 0.0f;
+  shoulderState_.previousVelocityErrorDegPerSec = 0.0f;
+  shoulderState_.positionIntegralDegSec = 0.0f;
+  shoulderState_.velocityIntegralDeg = 0.0f;
   shoulderState_.outputPercent = 0.0f;
   shoulderState_.controllerInitialized = false;
   shoulderState_.commandInitialized = false;
+  shoulderState_.velocityErrorInitialized = false;
+  shoulderState_.positionOutputSaturated = false;
   shoulderState_.outputSaturated = false;
   elbowState_.velocityDegPerSec = 0.0f;
   elbowState_.commandedVelocityDegPerSec = 0.0f;
-  elbowState_.integralDegSec = 0.0f;
+  elbowState_.previousVelocityErrorDegPerSec = 0.0f;
+  elbowState_.positionIntegralDegSec = 0.0f;
+  elbowState_.velocityIntegralDeg = 0.0f;
   elbowState_.outputPercent = 0.0f;
   elbowState_.controllerInitialized = false;
   elbowState_.commandInitialized = false;
+  elbowState_.velocityErrorInitialized = false;
+  elbowState_.positionOutputSaturated = false;
   elbowState_.outputSaturated = false;
   gravityHoldActive_ = false;
   gravityHoldSettledSinceUs_ = 0;
@@ -464,9 +488,13 @@ void Arm::enterFault() {
   telemetry_.timestampUs = micros();
   shoulderState_.controllerInitialized = false;
   shoulderState_.commandInitialized = false;
+  shoulderState_.velocityErrorInitialized = false;
+  shoulderState_.positionOutputSaturated = false;
   shoulderState_.outputSaturated = false;
   elbowState_.controllerInitialized = false;
   elbowState_.commandInitialized = false;
+  elbowState_.velocityErrorInitialized = false;
+  elbowState_.positionOutputSaturated = false;
   elbowState_.outputSaturated = false;
   gravityHoldActive_ = false;
   gravityHoldSettledSinceUs_ = 0;
@@ -499,59 +527,120 @@ float Arm::updateJoint(Motor *motor, const JointConfig &config,
   state->velocityDegPerSec += alpha * (rawVelocity - state->velocityDegPerSec);
   state->previousPositionDeg = positionDeg;
 
-  const float error = commandedPositionDeg - positionDeg;
+  const float positionError = commandedPositionDeg - positionDeg;
   const bool withinPositionTolerance =
-      fabsf(error) <= fabsf(config.positionToleranceDeg);
-  float pOutput = config.kP * error;
-  // Derivative on measurement avoids a derivative kick when the command changes.
-  float dOutput = -config.kD * state->velocityDegPerSec;
+      fabsf(positionError) <= fabsf(config.positionToleranceDeg);
 
-  if (!feedbackEnabled || config.constantPidTestEnabled) {
-    state->integralDegSec = 0.0f;
+  // Outer position loop. The interpolated trajectory velocity is feedforward;
+  // the PID terms correct position tracking error around that trajectory.
+  const float positionErrorRate =
+      state->commandedVelocityDegPerSec - state->velocityDegPerSec;
+  if (!feedbackEnabled || config.constantPidTestEnabled ||
+      config.manualVelocityTestEnabled) {
+    state->positionIntegralDegSec = 0.0f;
   } else if (!withinPositionTolerance) {
-    if (fabsf(error) < fabsf(config.integralZoneDeg) &&
-        !state->outputSaturated) {
-      state->integralDegSec += error * dtSec;
+    if (fabsf(positionError) < fabsf(config.positionIntegralZoneDeg) &&
+        !state->positionOutputSaturated) {
+      state->positionIntegralDegSec += positionError * dtSec;
     } else {
-      state->integralDegSec *= clamp(config.integralDecay, 0.0f, 1.0f);
+      state->positionIntegralDegSec *=
+          clamp(config.integralDecay, 0.0f, 1.0f);
     }
   }
-  state->integralDegSec =
-      clamp(state->integralDegSec, -fabsf(config.integralLimitDegSec),
-            fabsf(config.integralLimitDegSec));
-  float integralOutput = config.kI * state->integralDegSec;
-  float pidOutput = pOutput + dOutput + integralOutput;
-  if (!feedbackEnabled) {
-    pOutput = 0.0f;
-    dOutput = 0.0f;
-    integralOutput = 0.0f;
-    pidOutput = 0.0f;
-  } else if (config.constantPidTestEnabled) {
-    pidOutput =
-        clamp(config.constantPidOutputPercent, -fabsf(config.maxPwmPercent),
-              fabsf(config.maxPwmPercent));
-    pOutput = pidOutput;
-    dOutput = 0.0f;
-    integralOutput = 0.0f;
-  } else if (withinPositionTolerance) {
-    // Hold the accumulated integral inside the acceptable position window and
-    // use only that existing I contribution plus gravity compensation.
-    pOutput = 0.0f;
-    dOutput = 0.0f;
-    pidOutput = integralOutput;
+  state->positionIntegralDegSec =
+      clamp(state->positionIntegralDegSec,
+            -fabsf(config.positionIntegralLimitDegSec),
+            fabsf(config.positionIntegralLimitDegSec));
+
+  float positionP = config.positionKp * positionError;
+  float positionI = config.positionKi * state->positionIntegralDegSec;
+  float positionD = config.positionKd * positionErrorRate;
+  if (withinPositionTolerance) {
+    positionP = 0.0f;
+    positionD = 0.0f;
+  }
+  float unclampedTargetVelocity =
+      state->commandedVelocityDegPerSec + positionP + positionI + positionD;
+  float targetVelocity =
+      clamp(unclampedTargetVelocity, -fabsf(config.maxVelocityDegPerSec),
+            fabsf(config.maxVelocityDegPerSec));
+  state->positionOutputSaturated =
+      targetVelocity != unclampedTargetVelocity;
+  if (config.manualVelocityTestEnabled) {
+    positionP = 0.0f;
+    positionI = 0.0f;
+    positionD = 0.0f;
+    targetVelocity =
+        clamp(config.manualTargetVelocityDegPerSec,
+              -fabsf(config.maxVelocityDegPerSec),
+              fabsf(config.maxVelocityDegPerSec));
+    state->positionOutputSaturated =
+        targetVelocity != config.manualTargetVelocityDegPerSec;
   }
 
-  // While an interpolated command is moving, use its direction for static
-  // friction feedforward. This avoids waiting for the position error to grow
-  // past the tolerance and then breaking away in visible steps.
-  const bool commandMoving =
-      fabsf(state->commandedVelocityDegPerSec) > 0.01f;
+  // Inner velocity loop. Its output is motor PWM percentage.
+  float velocityError = targetVelocity - state->velocityDegPerSec;
+  float velocityErrorRate = 0.0f;
+  if (state->velocityErrorInitialized) {
+    velocityErrorRate =
+        (velocityError - state->previousVelocityErrorDegPerSec) / dtSec;
+  } else {
+    state->velocityErrorInitialized = true;
+  }
+  state->previousVelocityErrorDegPerSec = velocityError;
+
+  if (!feedbackEnabled || config.constantPidTestEnabled) {
+    state->velocityIntegralDeg = 0.0f;
+  } else if (fabsf(velocityError) <
+                 fabsf(config.velocityIntegralZoneDegPerSec) &&
+             !state->outputSaturated) {
+    state->velocityIntegralDeg += velocityError * dtSec;
+  } else {
+    state->velocityIntegralDeg *= clamp(config.integralDecay, 0.0f, 1.0f);
+  }
+  state->velocityIntegralDeg =
+      clamp(state->velocityIntegralDeg,
+            -fabsf(config.velocityIntegralLimitDeg),
+            fabsf(config.velocityIntegralLimitDeg));
+
+  float velocityP = config.velocityKp * velocityError;
+  float velocityI = config.velocityKi * state->velocityIntegralDeg;
+  float velocityD = config.velocityKd * velocityErrorRate;
+  float velocityPidOutput = velocityP + velocityI + velocityD;
+  if (!feedbackEnabled) {
+    positionP = 0.0f;
+    positionI = 0.0f;
+    positionD = 0.0f;
+    targetVelocity = 0.0f;
+    velocityError = 0.0f;
+    velocityP = 0.0f;
+    velocityI = 0.0f;
+    velocityD = 0.0f;
+    velocityPidOutput = 0.0f;
+  } else if (config.constantPidTestEnabled) {
+    velocityPidOutput =
+        clamp(config.constantPidOutputPercent, -fabsf(config.maxPwmPercent),
+              fabsf(config.maxPwmPercent));
+    positionP = 0.0f;
+    positionI = 0.0f;
+    positionD = 0.0f;
+    targetVelocity = 0.0f;
+    velocityError = 0.0f;
+    velocityP = velocityPidOutput;
+    velocityI = 0.0f;
+    velocityD = 0.0f;
+  }
+
+  // Apply velocity and static-friction feedforward in the direction requested
+  // by the cascaded controller.
+  const bool commandMoving = fabsf(targetVelocity) > 0.01f;
   const int motionDirection =
-      commandMoving ? directionSign(state->commandedVelocityDegPerSec)
-                    : directionSign(error);
+      commandMoving ? directionSign(targetVelocity) : 0;
+  float velocityFeedforward = 0.0f;
   float friction = 0.0f;
-  if (feedbackEnabled && !config.constantPidTestEnabled &&
-      !withinPositionTolerance) {
+  if (feedbackEnabled && !config.constantPidTestEnabled && commandMoving) {
+    velocityFeedforward =
+        config.kVPercentPerDegPerSec * targetVelocity;
     if (motionDirection > 0) {
       friction = fabsf(config.positiveStaticFrictionPercent);
     } else if (motionDirection < 0) {
@@ -559,8 +648,9 @@ float Arm::updateJoint(Motor *motor, const JointConfig &config,
     }
   }
 
-  const float feedbackWithFriction = pidOutput + friction;
-  const float unclamped = feedbackWithFriction + gravityPercent;
+  const float feedbackAndFeedforward =
+      velocityPidOutput + velocityFeedforward + friction;
+  const float unclamped = feedbackAndFeedforward + gravityPercent;
   const float clampedOutput =
       clamp(unclamped, -fabsf(config.maxPwmPercent),
             fabsf(config.maxPwmPercent));
@@ -599,13 +689,21 @@ float Arm::updateJoint(Motor *motor, const JointConfig &config,
   telemetry->commandedPositionDeg = commandedPositionDeg;
   telemetry->measuredPositionDeg = positionDeg;
   telemetry->measuredVelocityDegPerSec = state->velocityDegPerSec;
-  telemetry->positionErrorDeg = error;
-  telemetry->pOutputPercent = pOutput;
-  telemetry->dOutputPercent = dOutput;
+  telemetry->positionErrorDeg = positionError;
+  telemetry->trajectoryVelocityDegPerSec =
+      state->commandedVelocityDegPerSec;
+  telemetry->targetVelocityDegPerSec = targetVelocity;
+  telemetry->velocityErrorDegPerSec = velocityError;
+  telemetry->positionPOutputDegPerSec = positionP;
+  telemetry->positionIOutputDegPerSec = positionI;
+  telemetry->positionDOutputDegPerSec = positionD;
+  telemetry->velocityPOutputPercent = velocityP;
+  telemetry->velocityIOutputPercent = velocityI;
+  telemetry->velocityDOutputPercent = velocityD;
+  telemetry->velocityFeedforwardPercent = velocityFeedforward;
   telemetry->frictionPercent = friction;
   telemetry->gravityPercent = gravityPercent;
-  telemetry->integralOutputPercent = integralOutput;
-  telemetry->pidOutputPercent = pidOutput;
+  telemetry->velocityPidOutputPercent = velocityPidOutput;
   telemetry->unclampedOutputPercent = unclamped;
   telemetry->finalPwmPercent = output;
   telemetry->saturated = clampedOutput != unclamped;
