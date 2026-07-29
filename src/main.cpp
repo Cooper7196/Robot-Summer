@@ -13,6 +13,13 @@
 #include <Arduino.h>
 
 constexpr uint32_t kSerialBaud = 115200;
+// LEDC channels 0 and 1 share a timer. Servo 1 uses channel 0 at 50 Hz, so
+// use channel 2 to keep the LED's 5 kHz PWM on a separate timer.
+constexpr uint8_t kLedPwmChannel = 2;
+constexpr uint16_t kLedPwmFrequencyHz = 5000;
+constexpr uint8_t kLedPwmResolutionBits = 8;
+constexpr float kInitialLedBrightnessPercent = 10.0f;
+constexpr uint32_t kLedBlinkIntervalMs = 100;
 const OtosSensor::Pose kTargetPose(0.0f, 100.0f, 0.0f);
 constexpr float kTapeAdcReferenceVolts = 3.3f;
 constexpr float kTapeThresholdVolts = 1.1f;
@@ -50,7 +57,7 @@ constexpr uint8_t kTapeCalibrationPeakConfirmSamples = 1;
 constexpr float kTapeCalibrationProfileSpacingCm = 0.05f;
 constexpr uint16_t kTapeCalibrationMaxProfileSamples = 640;
 constexpr uint32_t kCalibrationSettleDelayMs = 250;
-constexpr float kMetalAnomalyThresholdHz = 90.0f;
+constexpr float kMetalAnomalyThresholdHz = 100.0f;
 constexpr uint8_t kMetalDeviationAverageSamples = 5;
 // Calibrated against a 16.20 V multimeter reading (ADC initially reported
 // 15.77 V with the nominal 6.5:1 divider ratio).
@@ -100,6 +107,8 @@ constexpr float clawOpenAngle = 40.0f;
 constexpr float clawHabitatOpenAngle = 115.0f;
 constexpr float clawClosedAngle = 115.0f;
 constexpr float clawFullyClosedAngle = 142.0f;
+
+int teletubbyCount = 0;
 
 uint16_t adcCountFromVolts(float volts) {
   if (volts <= 0.0f) {
@@ -301,10 +310,58 @@ bool gravityCompensationReady = false;
 bool metalDetectorLeftReady = false;
 bool metalDetectorRightReady = false;
 bool cameraDetectorReady = false;
+bool ledPwmReady = false;
 
 bool rockHeld = false;
 
 constexpr uint32_t kGrabRockTaskStackSize = 3072;
+
+bool setLedBrightness(float percent) {
+  if (!ledPwmReady || !isfinite(percent)) {
+    return false;
+  }
+
+  percent = constrain(percent, 0.0f, 100.0f);
+  const uint32_t maxDuty = (1UL << kLedPwmResolutionBits) - 1UL;
+  const uint32_t duty =
+      static_cast<uint32_t>((percent / 100.0f) * maxDuty + 0.5f);
+  ledcWrite(kLedPwmChannel, duty);
+  return true;
+}
+
+bool beginLedPwm() {
+  if (ledcSetup(kLedPwmChannel, kLedPwmFrequencyHz, kLedPwmResolutionBits) <=
+      0.0) {
+    return false;
+  }
+
+  ledcAttachPin(pins::SERVO2_PWM_PIN, kLedPwmChannel);
+  ledPwmReady = true;
+  return setLedBrightness(0);
+}
+
+bool blinkLeds(uint32_t durationMs) {
+  if (!ledPwmReady) {
+    return false;
+  }
+
+  const uint32_t startMs = millis();
+  bool ledsOn = true;
+
+  while (millis() - startMs < durationMs) {
+    if (!setLedBrightness(ledsOn ? 100.0f : 0.0f)) {
+      return false;
+    }
+
+    const uint32_t elapsedMs = millis() - startMs;
+    const uint32_t remainingMs =
+        elapsedMs < durationMs ? durationMs - elapsedMs : 0;
+    delay(min(kLedBlinkIntervalMs, remainingMs));
+    ledsOn = !ledsOn;
+  }
+
+  return setLedBrightness(0.0f);
+}
 
 bool beginArmStaticFrictionTuning(const Arm::JointAngles &startingAngles) {
   if (!armTask.setTargetAngles(startingAngles)) {
@@ -1001,6 +1058,22 @@ bool calibrateYWithMiddleTapeSensor(float knownTapeYCm, float searchDirection,
                                        searchDirection, searchPower);
 }
 
+bool checkForTeletubby() {
+  Serial2.write('C');
+  if (teletubbyCount >= 2) {
+    return false;
+  }
+
+  cameraDetector.resetPositiveCount();
+  delay(750);
+  if (cameraDetector.positiveCount() >= 2) {
+    blinkLeds(600);
+    teletubbyCount++;
+    return true;
+  }
+  return false;
+}
+
 void stowGrabbedRock() {
   armTask.waitUntilSettled(1000);
   armTask.setTargetPosition({11.0f, 17.0f}, true);
@@ -1032,7 +1105,7 @@ void grabRock() {
     Serial.println("Could not get pose for grab approach");
   }
 
-  armTask.setTargetPosition({29.5f, -2.5f}, true);
+  armTask.setTargetPosition({29.5f, -3.5f}, true);
   armTask.waitUntilSettled(1000);
   servo1.setAngle(clawClosedAngle);
   delay(500);
@@ -1056,7 +1129,7 @@ void grabRock() {
 }
 
 void runPath() {
-  bool lastRockMetalDetected = false;
+  bool lastRockMetal = false;
   // delay(2000);
   // Print the three installed tape sensors continuously for diagnostics.
 
@@ -1083,93 +1156,131 @@ void runPath() {
   driveTask.waitUntilMotionFinished(10000);
 
   if (!rockHeld) {
-    driveTask.calibrateImuBlocking(750);
-    lastRockMetalDetected = confirmedMetalDetected(metalDetectorRight);
+    driveTask.calibrateImuBlocking(500);
+    lastRockMetal = confirmedMetalDetected(metalDetectorRight);
   }
-  driveTask.setTargetPose({-10.0f, 95.0f, 0.0f}, 1.0f);
+  driveTask.setTargetPose({-8.0f, 95.0f, 0.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-10.0f, 100.0f, 90.0f}, 1.0f);
+  driveTask.setTargetPose({-8.0f, 100.0f, 90.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
-  delay(1000);
+  checkForTeletubby();
   // detect telletubby
-  driveTask.setTargetPose({-10.0f, 90.0f, 90.0f}, 1.0f);
+  driveTask.setTargetPose({-8.0f, 90.0f, 90.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
-  delay(1000);
+  checkForTeletubby();
 
-  if (lastRockMetalDetected) {
-    driveTask.setTargetPose({-10.0f, 90.0f, -90.0f}, 1.0f);
+  if (lastRockMetal) {
+    servo1.setAngle(clawOpenAngle);
+    driveTask.setTargetPose({-8.0f, 95.0f, -90.0f}, 1.0f);
     armTask.setTargetPosition({29.5f, 5.0f}, true);
     driveTask.waitUntilMotionFinished(10000);
-    servo1.setAngle(clawOpenAngle);
-    driveTask.setTargetPose({-7, 95, -90.0f}, 1.0f, true);
+    driveTask.setTargetPose({-7.0f, 95.0f, -90.0f}, 1.0f, true);
     driveTask.waitUntilMotionFinished(10000);
     armTask.setTargetPosition({29.5f, -2.5f}, true);
-    driveTask.setTargetPose({1.0, 95, -90.0f}, 0.25f);
+    armTask.waitUntilSettled(1000);
+    driveTask.setTargetPose({-3.0, 95.0f, -90.0f}, 0.25f);
     driveTask.waitUntilMotionFinished(10000);
     grabRock();
     delay(250);
   }
-  lastRockMetalDetected = false;
+  lastRockMetal = false;
 
   driveTask.setTargetPose({-2.0f, 116.0f, 0.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({10.5f, 134.0f, 0.0f}, 1.0f, true);
+  driveTask.setTargetPose({10.5f, 144.0f, 0.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({8.5f, 159.0f, 15.0f}, 1.0f, true);
+  driveTask.setTargetPose({8.5f, 166.0f, 15.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-7.5f, 169.0f, 61.5f}, 1.0f);
+  driveTask.setTargetPose({-3.5f, 175.0f, 61.5f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
-  /*
+
+  bool leftRockMetal = false;
+  bool rightRockMetal = false;
 
   if (!rockHeld) {
-    driveTask.calibrateImuBlocking(750);
-    if (confirmedMetalDetected(metalDetectorLeft)) {
-      servo1.setAngle(clawOpenAngle);
-      driveTask.setTargetPose({-17, 184, 61.0f}, 1.0f);
-      driveTask.waitUntilMotionFinished(10000);
-      driveTask.setTargetPose({-17, 184, -180.0f}, 1.0f);
-      driveTask.waitUntilMotionFinished(10000);
-      driveTask.setTargetPose({-17, 172, -180.0f}, 0.25f);
-      delay(500);
-      grabRock();
-    }
+    driveTask.calibrateImuBlocking(500);
+    rightRockMetal = confirmedMetalDetected(metalDetectorRight);
   }
 
   if (!rockHeld) {
-    driveTask.setTargetPose({-3.5f, 175.0f, 61.5f}, 1.0f);
+    driveTask.setTargetPose({-4.0f, 169.5f, 61.5f}, 1.0f);
     driveTask.waitUntilMotionFinished(10000);
-    delay(650);
-    if (confirmedMetalDetected(metalDetectorRight)) {
-      servo1.setAngle(clawOpenAngle);
-      driveTask.setTargetPose({-30, 185, 61.0f}, 1.0f);
-      driveTask.waitUntilMotionFinished(10000);
-      driveTask.setTargetPose({-28, 194, -90.0f}, 1.0f);
-      driveTask.waitUntilMotionFinished(10000);
-      driveTask.setTargetPose({-18, 194, -90.0f}, 0.25f);
-      driveTask.waitUntilMotionFinished(10000);
-      delay(500);
-      grabRock();
-    }
+    driveTask.calibrateImuBlocking(500);
+    leftRockMetal = confirmedMetalDetected(metalDetectorLeft);
   }
 
+  driveTask.setTargetPose({-30, 185, 90.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-30, 195, 100.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  checkForTeletubby();
+
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-23, 187, 20.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  checkForTeletubby();
+
+  driveTask.setTargetPose({-30, 185, 20.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  checkForTeletubby();
+
+  if (leftRockMetal) {
+    armTask.setTargetPosition({29.5f, 5.0f}, true);
+    servo1.setAngle(clawOpenAngle);
+    driveTask.setTargetPose({-15, 184, 61.0f}, 1.0f, true);
+    driveTask.waitUntilMotionFinished(10000);
+    armTask.setTargetPosition({29.5f, -2.5f}, true);
+    driveTask.setTargetPose({-15, 184, -180.0f}, 1.0f);
+    driveTask.waitUntilMotionFinished(10000);
+    driveTask.setTargetPose({-15, 172, -180.0f}, 0.25f);
+    delay(500);
+    grabRock();
+  }
+  if (rightRockMetal) {
+    armTask.setTargetPosition({29.5f, 5.0f}, true);
+    servo1.setAngle(clawOpenAngle);
+    driveTask.setTargetPose({-30, 185, 0.0f}, 1.0f);
+    armTask.setTargetPosition({29.5f, -3.5f}, true);
+    driveTask.waitUntilMotionFinished(10000);
+    driveTask.setTargetPose({-28, 194, -90.0f}, 1.0f);
+    driveTask.waitUntilMotionFinished(10000);
+    driveTask.setTargetPose({-18, 194, -90.0f}, 0.25f);
+    driveTask.waitUntilMotionFinished(10000);
+    delay(500);
+    grabRock();
+  }
   driveTask.setTargetPose({-28.5f, 187.0f, 90.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-49.5f, 183.0f, 145.0f}, 1.0f);
-  driveTask.waitUntilMotionFinished(10000);
-
   if (!rockHeld) {
-    driveTask.calibrateImuBlocking(750);
-    if (confirmedMetalDetected(metalDetectorRight)) {
-      servo1.setAngle(clawOpenAngle);
-      driveTask.setTargetPose({-30, 189, 121.0f}, 1.0f, true);
-      driveTask.waitUntilMotionFinished(10000);
-      driveTask.setTargetPose({-34, 195, 88.0f}, 1.0f, true);
-      driveTask.waitUntilMotionFinished(10000);
-      driveTask.setTargetPose({-43, 195, 88.0f}, 0.25f);
-      driveTask.waitUntilMotionFinished(10000);
-      grabRock();
-    }
+    driveTask.setTargetPose({-49.5f, 183.0f, 145.0f}, 1.0f);
+    driveTask.waitUntilMotionFinished(10000);
+
+    driveTask.calibrateImuBlocking(500);
+    lastRockMetal = confirmedMetalDetected(metalDetectorRight);
+    driveTask.setTargetPose({-43.0f, 177.0f, 145.0f}, 1.0f, true);
+    driveTask.waitUntilMotionFinished(10000);
   }
+
+  driveTask.setTargetPose({-38.0f, 185.0f, -125.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  checkForTeletubby();
+
+  driveTask.setTargetPose({-45.0f, 181.0f, -125.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  checkForTeletubby();
+
+  if (lastRockMetal) {
+    armTask.setTargetPosition({29.5f, 5.0f}, true);
+    servo1.setAngle(clawOpenAngle);
+    driveTask.setTargetPose({-30, 197.5, 90.0f}, 1.0f);
+    driveTask.waitUntilMotionFinished(10000);
+    armTask.setTargetPosition({29.5f, -3.5f}, true);
+    delay(500);
+    driveTask.setTargetPose({-43, 197.5, 90.0f}, 1.0f);
+    driveTask.waitUntilMotionFinished(10000);
+    grabRock();
+  }
+  lastRockMetal = false;
 
   driveTask.setTargetPose({-55.0f, 184.0f, 180.0f}, 0.8f);
   driveTask.waitUntilMotionFinished(10000);
@@ -1181,7 +1292,8 @@ void runPath() {
   driveTask.waitUntilMotionFinished(10000);
   driveTask.calibrateImuBlocking(750);
   if (!rockHeld) {
-    if (confirmedMetalDetected(metalDetectorLeft)) {
+    lastRockMetal = confirmedMetalDetected(metalDetectorLeft);
+    if (false) {
       servo1.setAngle(clawOpenAngle);
       delay(250);
       driveTask.setTargetPose({-73.0f, 22.0f, 147.0f}, 1.0f);
@@ -1195,21 +1307,39 @@ void runPath() {
     }
   }
 
-  if (rockHeld) {
-    driveTask.setTargetPose({-72.0f, 13.0f, 134.0f}, 1.0f, true);
+  driveTask.setTargetPose({-72.0f, 13.0f, 134.0f}, 1.0f, true);
+  driveTask.waitUntilMotionFinished(10000);
+  driveTask.setTargetPose({-77.0f, 11.5f, 45.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  checkForTeletubby();
+  driveTask.setTargetPose({-69.0f, 18.0f, 45.0f}, 1.0f);
+  driveTask.waitUntilMotionFinished(10000);
+  checkForTeletubby();
+
+  if (lastRockMetal) {
+    servo1.setAngle(clawOpenAngle);
+    armTask.setTargetPosition({29.5f, 5.0f}, true);
+    driveTask.setTargetPose({-69.0f, 18.0f, -135.0f}, 1.0f);
     driveTask.waitUntilMotionFinished(10000);
-  } else {
-    driveTask.setTargetPose({-67, 21.5, 78}, 1.0);
+    armTask.setTargetPosition({29.5f, -3.5f}, true);
+    driveTask.setTargetPose({-74.5f, 20.0f, -135.0f}, 1.0f);
     driveTask.waitUntilMotionFinished(10000);
-    driveTask.setTargetPose({-78.5, 19.2, 78}, 0.25);
+    driveTask.setTargetPose({-65.5f, 11.0f, -135.0f}, 0.25f);
     driveTask.waitUntilMotionFinished(10000);
     delay(250);
     grabRock();
   }
 
-  driveTask.setTargetPose({-100.0f, 5.0f, 90.0f}, 1.0f, true);
+  if (teletubbyCount < 2) {
+    driveTask.setTargetPose({-72.5f, 11.0f, -125.0f}, 0.25f);
+    driveTask.waitUntilMotionFinished(10000);
+    blinkLeds(600);
+  }
+
+  driveTask.setTargetPose({-85.0f, 5.0f, -90.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-130.0f, 5.0f, 90.0f}, 1.0f);
+
+  driveTask.setTargetPose({-100.0f, 5.0f, -90.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({-130.0f, 5.0f, -90.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
@@ -1219,6 +1349,19 @@ void runPath() {
     driveTask.setTargetPose({-130.0f, 0.0f, -90.0f}, 1.0f);
     driveTask.waitUntilMotionFinished(10000);
   }
+  if (!rockHeld) {
+    servo1.setAngle(clawOpenAngle);
+    armTask.setTargetPosition({29.5f, -3.5f}, true);
+    driveTask.setTargetPose({-130.0f, 25.0f, -90.0f}, 1.0f);
+    driveTask.waitUntilMotionFinished(10000);
+    // armTask.setTargetPosition({29.5f, -3.5f}, true);
+    driveTask.setTargetPose({-120.0f, 25.0f, -90.0f}, 1.0f);
+    driveTask.waitUntilMotionFinished(10000);
+    grabRock();
+    driveTask.setTargetPose({-144.0f, 25.0f, -90.0f}, 1.0f);
+    driveTask.waitUntilMotionFinished(10000);
+  }
+
   driveTask.setTargetPose({-144.0f, 94.0f, 0.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(10000);
 
@@ -1254,12 +1397,12 @@ void runPath() {
   driveTask.setMotionTolerance(0.5f, 1.0f);
   //  driveTask.setOtosPose({-125, 160.5, 0});
   delay(250);
-  driveTask.setTargetPose({-137.5f, 160.5f, 0.0f}, 0.3f);
+  driveTask.setTargetPose({-137.5f, 160.5f, 0.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
   // Calibrate X when the centered middle tape sensor is over the known
   // line.
 
-  while (!calibrateXWithMiddleTapeSensor(-151.7f, -1.0f, 0.08f)) {
+  while (!calibrateXWithMiddleTapeSensor(-151.7f, -1.0f, 0.1f)) {
     driveTask.setTargetPose({-137.5f, 160.5f, 0.0f}, 0.3f);
     driveTask.waitUntilMotionFinished(10000);
   }
@@ -1319,7 +1462,7 @@ void runPath() {
   driveTask.setTargetPose({-180.5f, 170.0f, 0.0f}, 0.1f);
   driveTask.waitUntilMotionFinished(10000);
   armTask.setTargetPosition({28.0f, 0.0f}, true);
-  delay(1000);
+  delay(500);
   servo1.setAngle(clawHabitatOpenAngle);
   armTask.setTargetPosition({28.0f, 10.0f}, true);
   armTask.waitUntilSettled(1000);
@@ -1332,25 +1475,25 @@ void runPath() {
   driveTask.setTargetPose({-155.5f, 137.5f, 90.0f}, 0.3f);
   driveTask.waitUntilMotionFinished(10000);
   armTask.setTargetPosition({28.0f, -8.0f}, true);
-  armTask.waitUntilSettled(1500);
+  armTask.waitUntilSettled(1000);
   servo1.setAngle(clawFullyClosedAngle);
-  delay(500);
+  delay(300);
   driveTask.setTargetPose({-155.5f, 138.5f, 85.0f}, 0.3f);
-  delay(500);
+  delay(300);
   driveTask.setTargetPose({-155.5f, 138.5f, 95.0f}, 0.3f);
-  delay(500);
+  delay(300);
   driveTask.setTargetPose({-147.5f, 138.5f, 90.0f}, 0.3f);
   driveTask.waitUntilMotionFinished(10000);
   armTask.setTargetPosition({28.0f, -5.0f}, true);
-  driveTask.setTargetPose({-147.5f, 148.5f, 90.0f}, 0.3f);
+  driveTask.setTargetPose({-147.5f, 148.5f, 90.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-158.0f, 148.5f, 90.0f}, 0.3f);
+  driveTask.setTargetPose({-158.0f, 148.5f, 90.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-157.0f, 126.5f, 90.0f}, 0.3f);
+  driveTask.setTargetPose({-157.0f, 126.5f, 90.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({-143.5f, 126.5f, 90.0f}, 0.3f);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-143.5f, 138.5f, 0.0f}, 0.3f);
+  driveTask.setTargetPose({-143.5f, 138.5f, 0.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
 
   driveTask.setTargetPose({-142.5f, 162.0f, 0.0f}, 0.3f);
@@ -1361,7 +1504,7 @@ void runPath() {
   driveTask.setTargetPose({-142.5f, 170.0f, 0.0f}, 0.1f);
   driveTask.waitUntilMotionFinished(10000);
   armTask.setTargetPosition({28.0f, 0.0f}, true);
-  delay(1000);
+  delay(500);
   servo1.setAngle(clawHabitatOpenAngle);
   armTask.setTargetPosition({28.0f, 10.0f}, true);
   armTask.waitUntilSettled(1000);
@@ -1373,23 +1516,23 @@ void runPath() {
   driveTask.setTargetPose({-155.5f, 137.5f, 90.0f}, 0.3f);
   driveTask.waitUntilMotionFinished(10000);
   armTask.setTargetPosition({28.0f, -8.0f}, true);
-  armTask.waitUntilSettled(1500);
+  armTask.waitUntilSettled(1000);
   servo1.setAngle(clawFullyClosedAngle);
-  delay(500);
+  delay(300);
   driveTask.setTargetPose({-155.5f, 138.5f, 85.0f}, 0.3f);
-  delay(500);
+  delay(300);
   driveTask.setTargetPose({-155.5f, 138.5f, 95.0f}, 0.3f);
-  delay(500);
-  driveTask.setTargetPose({-147.5f, 138.5f, 90.0f}, 0.3f);
+  delay(300);
+  driveTask.setTargetPose({-147.5f, 138.5f, 90.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
   armTask.setTargetPosition({28.0f, -5.0f}, true);
-  driveTask.setTargetPose({-147.5f, 148.5f, 90.0f}, 0.3f);
+  driveTask.setTargetPose({-147.5f, 148.5f, 90.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-158.0f, 148.5f, 90.0f}, 0.3f);
+  driveTask.setTargetPose({-158.0f, 148.5f, 90.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({-157.0f, 126.5f, 90.0f}, 0.3f);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-143.5f, 126.5f, 90.0f}, 0.3f);
+  driveTask.setTargetPose({-143.5f, 126.5f, 90.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({-161.5f, 161.0f, 0.0f}, 0.3);
   driveTask.waitUntilMotionFinished(10000);
@@ -1399,7 +1542,7 @@ void runPath() {
   driveTask.setTargetPose({-161.5f, 170.0f, 0.0f}, 0.1f);
   driveTask.waitUntilMotionFinished(10000);
   armTask.setTargetPosition({28.0f, 0.0f}, true);
-  delay(1000);
+  delay(500);
   servo1.setAngle(clawHabitatOpenAngle);
   armTask.setTargetPosition({28.0f, 10.0f}, true);
   armTask.waitUntilSettled(1000);
@@ -1410,25 +1553,25 @@ void runPath() {
   driveTask.setTargetPose({-155.5f, 137.5f, 90.0f}, 0.3f);
   driveTask.waitUntilMotionFinished(10000);
   armTask.setTargetPosition({28.0f, -8.0f}, true);
-  armTask.waitUntilSettled(1500);
+  armTask.waitUntilSettled(1000);
   servo1.setAngle(clawFullyClosedAngle);
-  delay(500);
+  delay(300);
   driveTask.setTargetPose({-155.5f, 138.5f, 85.0f}, 0.3f);
-  delay(500);
+  delay(300);
   driveTask.setTargetPose({-155.5f, 138.5f, 95.0f}, 0.3f);
-  delay(500);
-  driveTask.setTargetPose({-140.0f, 138.5f, 90.0f}, 0.3f);
+  delay(300);
+  driveTask.setTargetPose({-147.0f, 138.5f, 90.0f}, 0.3f);
   driveTask.waitUntilMotionFinished(10000);
   armTask.setTargetPosition({28.0f, -5.0f}, true);
-  driveTask.setTargetPose({-147.5f, 138.5f, 90.0f}, 0.3f);
+  driveTask.setTargetPose({-147.5f, 138.5f, 90.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-147.5f, 148.5f, 90.0f}, 0.3f);
+  driveTask.setTargetPose({-147.5f, 148.5f, 90.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-158.0f, 148.5f, 90.0f}, 0.3f);
+  driveTask.setTargetPose({-158.0f, 148.5f, 90.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({-157.0f, 126.5f, 90.0f}, 0.3f);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-143.5f, 126.5f, 90.0f}, 0.3f);
+  driveTask.setTargetPose({-143.5f, 126.5f, 90.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
 
   driveTask.setTargetPose({-124.9f, 162.0f, 0.0f}, 0.3f);
@@ -1438,37 +1581,35 @@ void runPath() {
   driveTask.setTargetPose({-124.9f, 170.0f, 0.0f}, 0.1f);
   driveTask.waitUntilMotionFinished(10000);
   armTask.setTargetPosition({28.0f, 0.0f}, true);
-  delay(1000);
+  delay(500);
   servo1.setAngle(clawHabitatOpenAngle);
   armTask.setTargetPosition({28.0f, 10.0f}, true);
   armTask.waitUntilSettled(1000);
-  driveTask.setTargetPose({-125.0f, 138.5f, 0.0f}, 0.3f);
-  driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-125.0f, 138.5f, 90.0f}, 0.3f);
+  driveTask.setTargetPose({-130.0f, 137.5f, 90.0f}, 0.3f);
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({-155.5f, 137.5f, 90.0f}, 0.3f);
   driveTask.waitUntilMotionFinished(10000);
   armTask.setTargetPosition({28.0f, -8.0f}, true);
-  armTask.waitUntilSettled(1500);
+  armTask.waitUntilSettled(1000);
   servo1.setAngle(clawFullyClosedAngle);
-  delay(500);
+  delay(300);
   driveTask.setTargetPose({-155.5f, 138.5f, 85.0f}, 0.3f);
-  delay(500);
+  delay(300);
   driveTask.setTargetPose({-155.5f, 138.5f, 95.0f}, 0.3f);
-  delay(500);
-  driveTask.setTargetPose({-140.0f, 138.5f, 90.0f}, 0.3f);
+  delay(300);
+  driveTask.setTargetPose({-145.0f, 138.5f, 90.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
-  delay(500);
   armTask.setTargetPosition({25.5, 6.0}, true);
   servo1.setAngle(clawOpenAngle);
-  driveTask.setTargetPose({-144.0f, 96.0f, -90.0f}, 1.0f);
+  armTask.setTargetPosition({27.0, 5.5}, true);
+  driveTask.setTargetPose({-144.0f, 96.0f, -90.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({-128.0f, 96.0f, -90.0f}, 0.1f);
   driveTask.waitUntilMotionFinished(3000);
-  armTask.setTargetPosition({27.0, 5.75}, true);
-  armTask.waitUntilSettled(1000);
+  armTask.waitUntilSettled(500);
   servo1.setAngle(clawFullyClosedAngle);
-  delay(1000);
+  armTask.setTargetPosition({27.0, 5.5}, true);
+  delay(500);
   driveTask.setTargetPose({-160.0f, 94.0f, -90.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
   servo1.setAngle(clawOpenAngle);
@@ -1527,6 +1668,7 @@ void setup() {
   cameraDetectorReady =
       cameraDetector.begin(pins::CAMERA_RX_PIN, pins::CAMERA_TX_PIN);
   const bool servo1Ready = servo1.begin(115.0f);
+  const bool ledPwmStarted = beginLedPwm();
   driveBase.begin();
   const bool tapeReady = tapeSensors.begin();
   metalDetectorLeftReady = metalDetectorLeft.begin();
@@ -1553,6 +1695,8 @@ void setup() {
                 pwmExpander.supplyVoltage(), kNormalizedMotorVoltage);
   Serial.println("Servo 1 " +
                  String(servo1Ready ? "ready at 90 degrees" : "not started"));
+  Serial.println("Servo 2 LED PWM " +
+                 String(ledPwmStarted ? "ready at 10%" : "not started"));
   Serial.println("TCA9548 encoder mux " +
                  String(encoderMuxReady ? "ready" : "not found"));
   Serial.println("Shoulder AS5600 encoder " +
@@ -1586,6 +1730,12 @@ void setup() {
     delay(100);
   }
 
+  cameraDetector.resetPositiveCount();
+  // while (true) {
+  //   Serial2.write('C');
+  //   blinkLeds(500);
+  //   delay(500);
+  // }
   Arm::JointAngles currentArmAngles;
   const bool armAnglesReady = shoulderEncoderReady && elbowEncoderReady &&
                               robotArm.readAngles(&currentArmAngles);
@@ -1667,6 +1817,7 @@ void setup() {
   // armTask.setTargetAngles({90.0f, -90.0f});
   servo1.setAngle(clawOpenAngle);
   armTask.setTargetPosition({20, 6}, true);
+  blinkLeds(500);
   // delay(3000);
   // grabRock();
   // armTask.waitUntilSettled(1500);
