@@ -169,9 +169,7 @@ MetalDetector::Config makeMetalDetectorConfig() {
 
 PwmExpander pwmExpander;
 
-float batteryVoltageForMetalDetector() {
-  return pwmExpander.supplyVoltage();
-}
+float batteryVoltageForMetalDetector() { return pwmExpander.supplyVoltage(); }
 
 AngleServo servo1(pins::SERVO1_PWM_PIN);
 OtosSensor otosSensor(Serial1);
@@ -1146,6 +1144,8 @@ void grabRock() {
 }
 
 void runPath() {
+  constexpr bool firstField = true;
+
   bool lastRockMetal = false;
   bool teletubbyFoundAtRock = false;
 
