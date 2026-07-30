@@ -57,7 +57,7 @@ constexpr uint8_t kTapeCalibrationPeakConfirmSamples = 1;
 constexpr float kTapeCalibrationProfileSpacingCm = 0.05f;
 constexpr uint16_t kTapeCalibrationMaxProfileSamples = 640;
 constexpr uint32_t kCalibrationSettleDelayMs = 250;
-constexpr float kMetalAnomalyThresholdHz = 100.0f;
+constexpr float kMetalAnomalyThresholdHz = 110.0f;
 constexpr float kMetalThresholdHighBatteryVoltage = 16.8f;
 constexpr float kMetalThresholdLowBatteryVoltage = 14.7f;
 constexpr float kMetalLowBatteryAnomalyThresholdHz = 60.0f;
@@ -1144,7 +1144,7 @@ void grabRock() {
 }
 
 void runPath() {
-  constexpr bool firstField = true;
+  constexpr bool firstField = false;
 
   bool lastRockMetal = false;
   bool teletubbyFoundAtRock = false;
@@ -1363,7 +1363,8 @@ void runPath() {
   driveTask.waitUntilMotionFinished(10000);
 
   // Run tape calibration
-  while (!calibrateYWithMiddleTapeSensor(4.0f, 1.0f, 0.07f)) {
+  float tapePosition = (firstField ? 4.0f : 3.0f);
+  while (!calibrateYWithMiddleTapeSensor(tapePosition, 1.0f, 0.07f)) {
     driveTask.setTargetPose({-130.0f, 0.0f, -90.0f}, 1.0f);
     driveTask.waitUntilMotionFinished(10000);
   }
@@ -1428,7 +1429,8 @@ void runPath() {
   driveTask.waitUntilMotionFinished(10000);
 
   // Run habitat tape calibration
-  while (!calibrateXWithMiddleTapeSensor(-151.7f, -1.0f, 0.09f)) {
+  tapePosition = (firstField ? -151.7f : -149.7f);
+  while (!calibrateXWithMiddleTapeSensor(tapePosition, -1.0f, 0.09f)) {
     driveTask.setTargetPose({-137.0f, 160.5f, 0.0f}, 0.3f);
     driveTask.waitUntilMotionFinished(10000);
   }
@@ -1440,16 +1442,29 @@ void runPath() {
   driveTask.setTargetPose({currentPose.xCm, 162.0f, 0.0f}, 0.3f);
   driveTask.waitUntilMotionFinished(1000);
 
-  // Move to first habitat position
-  driveTask.setTargetPose({-180.5f, 162.0f, 0.0f}, 0.3f);
-  servo1.setAngle(clawFullyClosedAngle);
-  armTask.setTargetPosition({26.0f, -8.0f}, true);
-  driveTask.waitUntilMotionFinished(2250);
-  delay(500);
+  if (firstField) {
+    // Move to first habitat position
+    driveTask.setTargetPose({-180.5f, 162.0f, 0.0f}, 0.3f);
+    servo1.setAngle(clawFullyClosedAngle);
+    armTask.setTargetPosition({26.0f, -8.0f}, true);
+    driveTask.waitUntilMotionFinished(2250);
+    delay(500);
 
-  // Move into first habitat rock
-  driveTask.setTargetPose({-180.5f, 170.0f, 0.0f}, 0.1f);
-  driveTask.waitUntilMotionFinished(10000);
+    // Move into first habitat
+    driveTask.setTargetPose({-180.5f, 170.0f, 0.0f}, 0.1f);
+    driveTask.waitUntilMotionFinished(10000);
+  } else {
+    // Move to first habitat position
+    driveTask.setTargetPose({-178.5f, 162.0f, 0.0f}, 0.3f);
+    servo1.setAngle(clawFullyClosedAngle);
+    armTask.setTargetPosition({26.0f, -8.0f}, true);
+    driveTask.waitUntilMotionFinished(2250);
+    delay(500);
+
+    // Move into first habitat
+    driveTask.setTargetPose({-178.5f, 170.0f, 0.0f}, 0.1f);
+    driveTask.waitUntilMotionFinished(10000);
+  }
   // Lift arm and open claw
   armTask.setTargetPosition({28.0f, 0.0f}, true);
   delay(500);
