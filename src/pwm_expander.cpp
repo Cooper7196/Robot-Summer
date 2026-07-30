@@ -4,7 +4,7 @@ PwmExpander::PwmExpander(uint8_t address, TwoWire &wire)
     : address_(address), wire_(&wire), driver_(address, wire),
       initialized_(false), voltageNormalizationEnabled_(false),
       voltageSensePin_(0), voltageDividerRatio_(1.0f), targetVoltage_(0.0f),
-      supplyVoltage_(0.0f), lastVoltageSampleMs_(0) {}
+      supplyVoltage_(0.0f), lastVoltageSampleMs_(0), voltageMutex_(nullptr) {}
 
 bool PwmExpander::begin(uint8_t sdaPin, uint8_t sclPin, float pwmFrequencyHz,
                         uint32_t i2cClockHz) {
@@ -39,6 +39,15 @@ void PwmExpander::enableVoltageNormalization(uint8_t sensePin,
     return;
   }
 
+  if (voltageMutex_ == nullptr) {
+    voltageMutex_ = xSemaphoreCreateMutex();
+  }
+  if (voltageMutex_ == nullptr) {
+    voltageNormalizationEnabled_ = false;
+    return;
+  }
+
+  xSemaphoreTake(voltageMutex_, portMAX_DELAY);
   voltageSensePin_ = sensePin;
   voltageDividerRatio_ = dividerRatio;
   targetVoltage_ = targetVoltage;
@@ -47,17 +56,22 @@ void PwmExpander::enableVoltageNormalization(uint8_t sensePin,
   pinMode(voltageSensePin_, INPUT);
   analogSetPinAttenuation(voltageSensePin_, ADC_11db);
   voltageNormalizationEnabled_ = true;
+  xSemaphoreGive(voltageMutex_);
   updateSupplyVoltage();
 }
 
-float PwmExpander::supplyVoltage() {
-  updateSupplyVoltage();
-  return supplyVoltage_;
-}
+float PwmExpander::supplyVoltage() { return updateSupplyVoltage(); }
 
-void PwmExpander::updateSupplyVoltage() {
+float PwmExpander::updateSupplyVoltage() {
+  if (voltageMutex_ == nullptr) {
+    return 0.0f;
+  }
+
+  xSemaphoreTake(voltageMutex_, portMAX_DELAY);
   if (!voltageNormalizationEnabled_) {
-    return;
+    const float voltage = supplyVoltage_;
+    xSemaphoreGive(voltageMutex_);
+    return voltage;
   }
 
   constexpr uint32_t kSampleIntervalMs = 20;
@@ -65,7 +79,9 @@ void PwmExpander::updateSupplyVoltage() {
   const uint32_t nowMs = millis();
   if (supplyVoltage_ > 0.0f &&
       nowMs - lastVoltageSampleMs_ < kSampleIntervalMs) {
-    return;
+    const float voltage = supplyVoltage_;
+    xSemaphoreGive(voltageMutex_);
+    return voltage;
   }
 
   uint32_t senseMillivolts = 0;
@@ -80,6 +96,9 @@ void PwmExpander::updateSupplyVoltage() {
     supplyVoltage_ =
         (static_cast<float>(senseMillivolts) / 1000.0f) * voltageDividerRatio_;
   }
+  const float voltage = supplyVoltage_;
+  xSemaphoreGive(voltageMutex_);
+  return voltage;
 }
 
 void PwmExpander::setChannel(uint8_t channel, uint16_t value) {
@@ -105,11 +124,11 @@ void PwmExpander::setChannelPercent(uint8_t channel, float percent) {
     return;
   }
 
-  updateSupplyVoltage();
-  if (voltageNormalizationEnabled_ && supplyVoltage_ > 0.0f) {
+  const float voltage = updateSupplyVoltage();
+  if (voltageNormalizationEnabled_ && voltage > 0.0f) {
     // A requested percentage represents that fraction of the target voltage.
     // Duty is capped below when the battery cannot produce the target voltage.
-    percent *= targetVoltage_ / supplyVoltage_;
+    percent *= targetVoltage_ / voltage;
   }
 
   if (percent <= 0.0f) {

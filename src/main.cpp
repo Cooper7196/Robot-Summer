@@ -58,6 +58,9 @@ constexpr float kTapeCalibrationProfileSpacingCm = 0.05f;
 constexpr uint16_t kTapeCalibrationMaxProfileSamples = 640;
 constexpr uint32_t kCalibrationSettleDelayMs = 250;
 constexpr float kMetalAnomalyThresholdHz = 100.0f;
+constexpr float kMetalThresholdHighBatteryVoltage = 16.8f;
+constexpr float kMetalThresholdLowBatteryVoltage = 14.7f;
+constexpr float kMetalLowBatteryAnomalyThresholdHz = 60.0f;
 constexpr uint8_t kMetalDeviationAverageSamples = 5;
 // Calibrated against a 16.20 V multimeter reading (ADC initially reported
 // 15.77 V with the nominal 6.5:1 divider ratio).
@@ -108,6 +111,8 @@ constexpr float clawHabitatOpenAngle = 115.0f;
 constexpr float clawClosedAngle = 115.0f;
 constexpr float clawFullyClosedAngle = 142.0f;
 
+constexpr float kIdleLedBrightnessPercent = 50.0f;
+
 int teletubbyCount = 0;
 bool rockHeld = false;
 
@@ -149,14 +154,25 @@ float tapeReadingPercentile(
   return static_cast<float>(TapeSensorArray::MAX_READING);
 }
 
+float batteryVoltageForMetalDetector();
+
 MetalDetector::Config makeMetalDetectorConfig() {
   MetalDetector::Config config;
   config.anomalyThresholdHz = kMetalAnomalyThresholdHz;
+  config.highBatteryVoltage = kMetalThresholdHighBatteryVoltage;
+  config.lowBatteryVoltage = kMetalThresholdLowBatteryVoltage;
+  config.lowBatteryAnomalyThresholdHz = kMetalLowBatteryAnomalyThresholdHz;
+  config.batteryVoltageProvider = batteryVoltageForMetalDetector;
   config.deviationAverageSamples = kMetalDeviationAverageSamples;
   return config;
 }
 
 PwmExpander pwmExpander;
+
+float batteryVoltageForMetalDetector() {
+  return pwmExpander.supplyVoltage();
+}
+
 AngleServo servo1(pins::SERVO1_PWM_PIN);
 OtosSensor otosSensor(Serial1);
 CameraDetector cameraDetector(Serial2);
@@ -338,7 +354,7 @@ bool beginLedPwm() {
 
   ledcAttachPin(pins::SERVO2_PWM_PIN, kLedPwmChannel);
   ledPwmReady = true;
-  return setLedBrightness(0);
+  return setLedBrightness(kIdleLedBrightnessPercent);
 }
 
 bool blinkLeds(uint32_t durationMs) {
@@ -361,7 +377,7 @@ bool blinkLeds(uint32_t durationMs) {
     ledsOn = !ledsOn;
   }
 
-  return setLedBrightness(0.0f);
+  return setLedBrightness(kIdleLedBrightnessPercent);
 }
 
 bool beginArmStaticFrictionTuning(const Arm::JointAngles &startingAngles) {
@@ -1131,6 +1147,7 @@ void grabRock() {
 
 void runPath() {
   bool lastRockMetal = false;
+  bool teletubbyFoundAtRock = false;
 
   // Drive to first rock
   driveTask.setTargetPose({-4.5f, 50.0f, 0.0f}, 1.0f, true);
@@ -1149,11 +1166,13 @@ void runPath() {
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({-8.0f, 100.0f, 90.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
-  checkForTeletubby();
+  teletubbyFoundAtRock = checkForTeletubby();
   // Move to second scanning position for rock 1
   driveTask.setTargetPose({-8.0f, 90.0f, 90.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
-  checkForTeletubby();
+  if (!teletubbyFoundAtRock) {
+    checkForTeletubby();
+  }
 
   // Pickup rock 1 if it is metal
   if (lastRockMetal) {
@@ -1209,11 +1228,13 @@ void runPath() {
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({-23, 187, 20.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
-  checkForTeletubby();
+  teletubbyFoundAtRock = checkForTeletubby();
   // Move to second scanning position for rock 2
   driveTask.setTargetPose({-30, 185, 20.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
-  checkForTeletubby();
+  if (!teletubbyFoundAtRock) {
+    checkForTeletubby();
+  }
 
   // Grab left rock if it is metal
   if (leftRockMetal) {
@@ -1258,11 +1279,13 @@ void runPath() {
   // Move to first scanning position for rock 4
   driveTask.setTargetPose({-38.0f, 185.0f, -125.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
-  checkForTeletubby();
+  teletubbyFoundAtRock = checkForTeletubby();
   // Move to second scanning position for rock 4
   driveTask.setTargetPose({-45.0f, 181.0f, -125.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
-  checkForTeletubby();
+  if (!teletubbyFoundAtRock) {
+    checkForTeletubby();
+  }
 
   // Grab rock 4 if it is metal
   if (lastRockMetal) {
@@ -1299,11 +1322,13 @@ void runPath() {
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({-77.0f, 11.5f, 45.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
-  checkForTeletubby();
+  teletubbyFoundAtRock = checkForTeletubby();
   // Move to second scanning position for rock 5
   driveTask.setTargetPose({-69.0f, 18.0f, 45.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
-  checkForTeletubby();
+  if (!teletubbyFoundAtRock) {
+    checkForTeletubby();
+  }
 
   // Grab rock 5 if it is metal
   if (lastRockMetal) {
@@ -1399,12 +1424,12 @@ void runPath() {
   delay(250);
 
   // Move to habitat tape calibration position
-  driveTask.setTargetPose({-137.5f, 160.5f, 0.0f}, 0.3f, true);
+  driveTask.setTargetPose({-137.0f, 160.5f, 0.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
 
   // Run habitat tape calibration
-  while (!calibrateXWithMiddleTapeSensor(-151.7f, -1.0f, 0.1f)) {
-    driveTask.setTargetPose({-137.5f, 160.5f, 0.0f}, 0.3f);
+  while (!calibrateXWithMiddleTapeSensor(-151.7f, -1.0f, 0.09f)) {
+    driveTask.setTargetPose({-137.0f, 160.5f, 0.0f}, 0.3f);
     driveTask.waitUntilMotionFinished(10000);
   }
   OtosSensor::Pose currentPose;
@@ -1416,7 +1441,7 @@ void runPath() {
   driveTask.waitUntilMotionFinished(1000);
 
   // Move to first habitat position
-  driveTask.setTargetPose({-180.5f, 161.5f, 0.0f}, 0.3f);
+  driveTask.setTargetPose({-180.5f, 162.0f, 0.0f}, 0.3f);
   servo1.setAngle(clawFullyClosedAngle);
   armTask.setTargetPosition({26.0f, -8.0f}, true);
   driveTask.waitUntilMotionFinished(2250);
@@ -1600,12 +1625,13 @@ void runPath() {
   armTask.setTargetPosition({27.0, 5.5}, true);
   driveTask.setTargetPose({-144.0f, 96.0f, -90.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-128.0f, 96.0f, -90.0f}, 0.1f);
+  driveTask.setTargetPose({-129.0f, 96.0f, -90.0f}, 0.1f);
   driveTask.waitUntilMotionFinished(3000);
+  armTask.setTargetPosition({27.0, 5.75}, true);
   armTask.waitUntilSettled(500);
+
   // Grab solar panel
   servo1.setAngle(clawFullyClosedAngle);
-  armTask.setTargetPosition({27.0, 6}, true);
   delay(500);
   driveTask.setTargetPose({-160.0f, 94.0f, -90.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
@@ -1613,51 +1639,7 @@ void runPath() {
   delay(500);
   armTask.cancel();
 
-  /*
-  driveTask.setTargetPose({-140.0f, 140.0f, -90.0f}, 1.0f, true);
-  driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-112.0f, 140.0f, -90.0f}, 1.0f);
-  driveTask.waitUntilMotionFinished(10000);
-  armTask.setTargetPosition({28.0f, 0.0f}, true);
-  delay(500);
-  servo1.setAngle(clawOpenAngle);
-  driveTask.setTargetPose({-112.0f, 140.0f, -100.0f}, 0.3f);
-  delay(500);
-  driveTask.setTargetPose({-112.0f, 140.0f, -80.0f}, 0.3f);
-  delay(500);
-
-
-  // driveTask.waitUntilMotionFinished(10000);
-  // driveTask.setTargetPose({-147.5f, 148.5f, 90.0f}, 0.4f);
-  // driveTask.waitUntilMotionFinished(10000);
-  // driveTask.setTargetPose({-156.5f, 148.5f, 90.0f}, 0.4f);
-  // driveTask.waitUntilMotionFinished(10000);
-  // driveTask.setTargetPose({-156.5f, 126.5f, 90.0f}, 0.4f);
-  // driveTask.waitUntilMotionFinished(10000);
-  // driveTask.setTargetPose({-143.5f, 126.5f, 90.0f}, 0.4f);
-  // driveTask.waitUntilMotionFinished(10000);
-  // driveTask.setTargetPose({-143.5f, 138.5f, 0.0f}, 0.4f);
-  // driveTask.waitUntilMotionFinished(10000);
-  // driveTask.setTargetPose({-143.5f, 163.0f, 0.0f}, 0.4f);
-  // driveTask.waitUntilMotionFinished(10000);
-
-  // driveTask.setTargetPose({-143.5f,
-  // delay(500);
-  // driveTask.setTargetPose({-126.5f, 166.0f, 0.0f}, 1.0f);
-  // driveTask.waitUntilMotionFinished(10000);
-  /*
-    servo1.setAngle(15);
-    delay(3000);
-    armTask.setTargetPosition({27.972f, 12.175f}, true);
-    delayWithArmLogging(2000);
-    armTask.setTargetPosition({23.0f, 1.5f}, true);
-    delayWithArmLogging(2000);
-    servo1.setAngle(115);
-    delayWithArmLogging(1000);
-    driveTask.setTargetPose({-138.0f, 97.0f, -90.0f}, 1.0f);
-    driveTask.waitUntilMotionFinished(10000);
-    servo1.setAngle(15);
-    */
+  /**/
 }
 
 void setup() {
@@ -1668,8 +1650,6 @@ void setup() {
   const bool ledPwmStarted = beginLedPwm();
   driveBase.begin();
   const bool tapeReady = tapeSensors.begin();
-  metalDetectorLeftReady = metalDetectorLeft.begin();
-  metalDetectorRightReady = metalDetectorRight.begin();
   const uint16_t tapeThreshold = adcCountFromVolts(kTapeThresholdVolts);
   tapeSensors.setThreshold(tapeThreshold);
   otosSensor.begin(OtosSensor::DEFAULT_BAUD_RATE, pins::OTOS_RX_PIN,
@@ -1683,6 +1663,8 @@ void setup() {
   pwmExpander.enableVoltageNormalization(pins::BATTERY_VOLTAGE_PIN,
                                          kBatteryVoltageDividerRatio,
                                          kNormalizedMotorVoltage);
+  metalDetectorLeftReady = metalDetectorLeft.begin();
+  metalDetectorRightReady = metalDetectorRight.begin();
   elbowEncoderReady = elbowEncoder.begin();
   shoulderEncoderReady = shoulderEncoder.begin();
   const bool encoderMuxReady = elbowEncoder.muxIsConnected();
@@ -1729,9 +1711,12 @@ void setup() {
 
   cameraDetector.resetPositiveCount();
   // while (true) {
-  //   Serial2.write('C');
-  //   blinkLeds(500);
-  //   delay(500);
+  //   if (cameraDetector.positiveCount() >= 3) {
+  //     Serial.println("Camera detector positive count reached threshold");
+  //     blinkLeds(600);
+  //     cameraDetector.resetPositiveCount();
+  //   }
+  //   delay(10);
   // }
   Arm::JointAngles currentArmAngles;
   const bool armAnglesReady = shoulderEncoderReady && elbowEncoderReady &&

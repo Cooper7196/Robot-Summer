@@ -24,6 +24,13 @@ public:
     // Metal is detected when the absolute difference between the measured
     // frequency and baseline is at least this many hertz.
     float anomalyThresholdHz = 100.0f;
+    // When configured, anomalyThresholdHz applies at highBatteryVoltage and
+    // lowBatteryAnomalyThresholdHz applies at lowBatteryVoltage. The active
+    // threshold is linearly interpolated and clamped between those endpoints.
+    float highBatteryVoltage = 0.0f;
+    float lowBatteryVoltage = 0.0f;
+    float lowBatteryAnomalyThresholdHz = 0.0f;
+    float (*batteryVoltageProvider)() = nullptr;
     // Require this many consecutive usable deviations and compare their
     // rolling median against the anomaly threshold. More samples reject brief
     // spikes, at the cost of sampleWindowMs of additional response time each.
@@ -43,6 +50,7 @@ public:
     float baselineHz = 0.0f;
     float deviationHz = 0.0f;
     float averagedDeviationHz = 0.0f;
+    float anomalyThresholdHz = 0.0f;
     float relativeDeviation = 0.0f;
     uint8_t averagedSampleCount = 0;
     uint32_t sampleTimeUs = 0;

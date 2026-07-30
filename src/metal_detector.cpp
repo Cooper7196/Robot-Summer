@@ -43,6 +43,11 @@ bool MetalDetector::begin() {
       config_.sampleWindowMs == 0 || config_.calibrationSamples == 0 ||
       config_.baselineTimeConstantSeconds <= 0.0f ||
       config_.anomalyThresholdHz < 0.0f ||
+      config_.highBatteryVoltage < 0.0f ||
+      config_.lowBatteryVoltage < 0.0f ||
+      config_.lowBatteryAnomalyThresholdHz < 0.0f ||
+      (config_.highBatteryVoltage > 0.0f &&
+       config_.highBatteryVoltage <= config_.lowBatteryVoltage) ||
       config_.deviationAverageSamples == 0 ||
       config_.deviationAverageSamples > MAX_DEVIATION_AVERAGE_SAMPLES ||
       config_.clearThresholdFraction < 0.0f ||
@@ -202,7 +207,23 @@ bool MetalDetector::update() {
     reading_.averagedDeviationHz =
         median(deviationSamples_, deviationSampleCount_);
 
-    const float threshold = config_.anomalyThresholdHz;
+    float threshold = config_.anomalyThresholdHz;
+    if (config_.batteryVoltageProvider != nullptr &&
+        config_.highBatteryVoltage > config_.lowBatteryVoltage) {
+      const float batteryVoltage = config_.batteryVoltageProvider();
+      if (isfinite(batteryVoltage) && batteryVoltage > 0.0f) {
+        const float voltageFraction =
+            fmaxf(0.0f, fminf((batteryVoltage - config_.lowBatteryVoltage) /
+                                  (config_.highBatteryVoltage -
+                                   config_.lowBatteryVoltage),
+                              1.0f));
+        threshold =
+            config_.lowBatteryAnomalyThresholdHz +
+            voltageFraction * (config_.anomalyThresholdHz -
+                               config_.lowBatteryAnomalyThresholdHz);
+      }
+    }
+    reading_.anomalyThresholdHz = threshold;
     const float activeThreshold =
         reading_.anomaly ? threshold * config_.clearThresholdFraction
                          : threshold;

@@ -3,6 +3,8 @@
 #include <Adafruit_PWMServoDriver.h>
 #include <Arduino.h>
 #include <Wire.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 class PwmExpander {
 public:
@@ -25,7 +27,7 @@ public:
   void setAllOff();
 
 private:
-  void updateSupplyVoltage();
+  float updateSupplyVoltage();
 
   uint8_t address_;
   TwoWire *wire_;
@@ -37,4 +39,5 @@ private:
   float targetVoltage_;
   float supplyVoltage_;
   uint32_t lastVoltageSampleMs_;
+  SemaphoreHandle_t voltageMutex_;
 };
