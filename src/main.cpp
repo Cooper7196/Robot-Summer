@@ -94,6 +94,8 @@ constexpr bool kArmPositionTuningEnabled =
     kArmTuningMode == ArmTuningMode::Position;
 constexpr bool kArmTuningEnabled = kArmTuningMode != ArmTuningMode::Disabled;
 constexpr uint32_t kArmVelocityTuningLogPeriodMs = 100;
+constexpr uint8_t kArmStartupMaxAttempts = 20;
+constexpr uint32_t kArmStartupRetryDelayMs = 100;
 
 // Replace these with each AS5600's raw reading at the position that should be
 // reported as 0 degrees.
@@ -198,7 +200,7 @@ bool shoulderEncoderReady = false;
 
 Arm::Config makeArmConfig() {
   Arm::Config config;
-  config.motorDisablePin = pins::EXTRA2_PIN;
+  config.motorDisablePin = pins::EXTRA1_PIN;
   config.gravityHoldEnabled = !kArmTuningEnabled;
   config.maxCartesianSpeedCmPerSec = 30.0f;
   config.pidReenableDriftDeg = 1.0f;
@@ -331,6 +333,54 @@ bool ledPwmReady = false;
 
 constexpr uint32_t kGrabRockTaskStackSize = 3072;
 
+bool beginPwmExpanderWithRetry() {
+  for (uint8_t attempt = 1; attempt <= kArmStartupMaxAttempts; ++attempt) {
+    if (pwmExpander.begin(pins::PWM_EXPANDER_SDA_PIN,
+                          pins::PWM_EXPANDER_SCL_PIN, 50.0f)) {
+      if (attempt > 1) {
+        Serial.printf("PCA9685 started on attempt %u\n", attempt);
+      }
+      return true;
+    }
+
+    Serial.printf("PCA9685 startup attempt %u/%u failed\n", attempt,
+                  kArmStartupMaxAttempts);
+    if (attempt < kArmStartupMaxAttempts) {
+      delay(kArmStartupRetryDelayMs);
+    }
+  }
+  return false;
+}
+
+bool beginArmFeedbackWithRetry(Arm::JointAngles *initialAngles) {
+  if (initialAngles == nullptr) {
+    return false;
+  }
+
+  for (uint8_t attempt = 1; attempt <= kArmStartupMaxAttempts; ++attempt) {
+    elbowEncoderReady = elbowEncoder.begin();
+    shoulderEncoderReady = shoulderEncoder.begin();
+    const bool anglesReady = shoulderEncoderReady && elbowEncoderReady &&
+                             robotArm.readAngles(initialAngles);
+    if (anglesReady) {
+      if (attempt > 1) {
+        Serial.printf("Arm feedback started on attempt %u\n", attempt);
+      }
+      return true;
+    }
+
+    Serial.printf(
+        "Arm feedback startup attempt %u/%u failed (shoulder=%s elbow=%s)\n",
+        attempt, kArmStartupMaxAttempts,
+        shoulderEncoderReady ? "ready" : "missing",
+        elbowEncoderReady ? "ready" : "missing");
+    if (attempt < kArmStartupMaxAttempts) {
+      delay(kArmStartupRetryDelayMs);
+    }
+  }
+  return false;
+}
+
 bool setLedBrightness(float percent) {
   if (!ledPwmReady || !isfinite(percent)) {
     return false;
@@ -379,6 +429,15 @@ bool blinkLeds(uint32_t durationMs) {
   }
 
   return setLedBrightness(kIdleLedBrightnessPercent);
+}
+
+void blinkLedsIndefinitely() {
+  bool ledsOn = true;
+  for (;;) {
+    setLedBrightness(ledsOn ? 100.0f : 0.0f);
+    ledsOn = !ledsOn;
+    delay(kLedBlinkIntervalMs);
+  }
 }
 
 bool beginArmStaticFrictionTuning(const Arm::JointAngles &startingAngles) {
@@ -1148,8 +1207,8 @@ void grabRock() {
 }
 
 void runPath() {
-  constexpr bool firstField = false;
-
+  const bool firstField = digitalRead(pins::EXTRA2_PIN) == LOW;
+  Serial.printf("Starting path on %s field\n", firstField ? "first" : "second");
   bool lastRockMetal = false;
   bool teletubbyFoundAtRock = false;
 
@@ -1429,8 +1488,8 @@ void runPath() {
 
   // Run habitat tape calibration
   tapePosition = (firstField ? -151.7f : -149.5f);
-  constexpr float habitatX = firstField ? -155.75f : -155.4f;
-  constexpr float habitatY = firstField ? 137.5f : 139.0f;
+  const float habitatX = firstField ? -155.75f : -155.4f;
+  const float habitatY = firstField ? 137.5f : 139.0f;
 
   while (!calibrateXWithMiddleTapeSensor(tapePosition, -1.0f, 0.08f)) {
     driveTask.setTargetPose({-137.0f, 160.5f, 0.0f}, 0.3f);
@@ -1714,21 +1773,20 @@ void setup() {
   const bool tapeReady = tapeSensors.begin();
   const uint16_t tapeThreshold = adcCountFromVolts(kTapeThresholdVolts);
   tapeSensors.setThreshold(tapeThreshold);
+  delay(3500);
   otosSensor.begin(OtosSensor::DEFAULT_BAUD_RATE, pins::OTOS_RX_PIN,
                    pins::OTOS_TX_PIN, pins::OTOS_DIR_PIN);
-  delay(4000);
   pinMode(pins::EXTRA2_PIN, INPUT_PULLDOWN);
   Serial.println("Starting PWM expander");
   //
-  const bool pwmReady = pwmExpander.begin(pins::PWM_EXPANDER_SDA_PIN,
-                                          pins::PWM_EXPANDER_SCL_PIN, 50.0f);
+  const bool pwmReady = beginPwmExpanderWithRetry();
   pwmExpander.enableVoltageNormalization(pins::BATTERY_VOLTAGE_PIN,
                                          kBatteryVoltageDividerRatio,
                                          kNormalizedMotorVoltage);
   metalDetectorLeftReady = metalDetectorLeft.begin();
   metalDetectorRightReady = metalDetectorRight.begin();
-  elbowEncoderReady = elbowEncoder.begin();
-  shoulderEncoderReady = shoulderEncoder.begin();
+  Arm::JointAngles currentArmAngles;
+  const bool armAnglesReady = beginArmFeedbackWithRetry(&currentArmAngles);
   const bool encoderMuxReady = elbowEncoder.muxIsConnected();
   const bool otosReady = otosSensor.ping();
   Serial.println("PCA9685 " + String(pwmReady ? "ready" : "not found"));
@@ -1780,9 +1838,6 @@ void setup() {
   //   }
   //   delay(10);
   // }
-  Arm::JointAngles currentArmAngles;
-  const bool armAnglesReady = shoulderEncoderReady && elbowEncoderReady &&
-                              robotArm.readAngles(&currentArmAngles);
   pwmMutex = xSemaphoreCreateMutex();
   driveTaskReady =
       pwmReady && otosReady && initialPoseSet && driveTask.begin(pwmMutex);
@@ -1790,6 +1845,12 @@ void setup() {
   Serial.println("Drive task " +
                  String(driveTaskReady ? "ready" : "not started"));
   Serial.println("Arm task " + String(armTaskReady ? "ready" : "not started"));
+  if (!driveTaskReady || !armTaskReady) {
+    Serial.printf("Startup halted: drive=%s arm=%s; blinking LEDs\n",
+                  driveTaskReady ? "ready" : "not started",
+                  armTaskReady ? "ready" : "not started");
+    blinkLedsIndefinitely();
+  }
   if (armTaskReady) {
     const bool gravityCompensationConfigured =
         armConfig.gravityA1Percent != 0.0f ||
@@ -1862,20 +1923,11 @@ void setup() {
   servo1.setAngle(clawOpenAngle);
   armTask.setTargetPosition({20, 6}, true);
   blinkLeds(500);
-  // delay(3000);
-  // grabRock();
-  // armTask.waitUntilSettled(1500);
-  // grabRock();
-  // servo1.setAngle(130);
-  // delay(500);
-  // armTask.setTargetPosition({28.0f, 16.0f}, true);
-  // armTask.waitUntilSettled(1500);
-  // armTask.setTargetPosition({10.0f, 7.0f}, true);
-  // armTask.waitUntilSettled(1500);
-  // armTask.setTargetPosition({8.480f, 1.093f}, true);
-  // armTask.waitUntilSettled(1500);
-  // servo1.setAngle(clawOpenAngles);
-  // armTask.setTargetPosition({10.80f, 13.0f}, true);
+  Serial.println("Waiting for drive switch");
+  while (digitalRead(pins::EXTRA1_PIN) == HIGH) {
+    delay(10);
+  }
+  Serial.println("Drive switch enabled; starting path");
 
   // armTask.setTargetPosition({28.0f, -8.0f}, true);
   // delay(5000);
@@ -1887,22 +1939,8 @@ void setup() {
   // servo1.setAngle(100.0f);
   // delay(250);
   // servo1.setAngle(142.0f);
+
   runPath();
-
-  // delay(2000);
-  // Serial.printf("calibrating X with middle tape sensor\n");
-  // calibrateXWithMiddleTapeSensor(0.0f, -1.0f, 0.05f);
-  // Serial.printf("calibrated\n");
-
-  // driveTask.setTargetPose({0.0f, 0.0f, 0.0f}, 0.1f);
-  // armTask.setTargetPosition({25.0f, 11.0f}, true);
-  // armTask.waitUntilSettled(3000);
-  // armTask.setTargetPosition({15.0f, 11.0f}, true);
-  // armTask.waitUntilSettled(3000);
-  // armTask.setTargetPosition({8.480f, 1.093f}, true);
-  // armTask.waitUntilSettled(3000);
-  // // servo1.setAngle(clawOpenAngle);
-  // armTask.setTargetPosition({10.80f, 13.0f}, true);
 
   while (false) {
     MetalDetector::Reading detectorLeftReading;

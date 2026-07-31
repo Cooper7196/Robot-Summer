@@ -9,27 +9,24 @@ constexpr float kDefaultIntegralZoneDeg = 7.5f;
 Arm::JointConfig::JointConfig()
     : encoderReferenceDeg(0.0f), jointReferenceDeg(0.0f), direction(1.0f),
       minAngleDeg(-180.0f), maxAngleDeg(180.0f), positionKp(5.0f),
-      positionKi(0.0f), positionKd(0.0f), velocityKp(0.2f),
-      velocityKi(0.0f), velocityKd(0.0f), maxVelocityDegPerSec(180.0f),
+      positionKi(0.0f), positionKd(0.0f), velocityKp(0.2f), velocityKi(0.0f),
+      velocityKd(0.0f), maxVelocityDegPerSec(180.0f),
       manualVelocityTestEnabled(false), manualTargetVelocityDegPerSec(0.0f),
       constantPidTestEnabled(false), constantPidOutputPercent(0.0f),
       velocityAlpha(0.15f), kVPercentPerDegPerSec(0.0f),
-      positiveStaticFrictionPercent(0.0f),
-      negativeStaticFrictionPercent(0.0f),
+      positiveStaticFrictionPercent(0.0f), negativeStaticFrictionPercent(0.0f),
       positionToleranceDeg(kDefaultToleranceDeg),
       positionIntegralZoneDeg(kDefaultIntegralZoneDeg),
-      positionIntegralLimitDegSec(5.0f),
-      velocityIntegralZoneDegPerSec(30.0f), velocityIntegralLimitDeg(30.0f),
-      integralDecay(0.95f), maxPwmPercent(60.0f),
-      maxOutputSlewPercentPerSec(200.0f) {}
+      positionIntegralLimitDegSec(5.0f), velocityIntegralZoneDegPerSec(30.0f),
+      velocityIntegralLimitDeg(30.0f), integralDecay(0.95f),
+      maxPwmPercent(60.0f), maxOutputSlewPercentPerSec(200.0f) {}
 
 Arm::Config::Config()
     : shoulderLinkCm(19.0f), elbowLinkCm(23.8675f),
       maxCartesianSpeedCmPerSec(10.0f), updatePeriodUs(4000),
       maxLoopDelayUs(50000), latchFaults(false), motorDisablePin(-1),
       gravityHoldEnabled(true), gravityHoldSettleTimeMs(250),
-      gravityHoldMaxVelocityDegPerSec(2.0f),
-      pidReenableDriftDeg(2.5f),
+      gravityHoldMaxVelocityDegPerSec(2.0f), pidReenableDriftDeg(2.5f),
       gravityA1Percent(0.0f), gravityA12Percent(0.0f), gravityA2Percent(0.0f),
       shoulder(), elbow() {}
 
@@ -38,10 +35,9 @@ Arm::JointState::JointState()
       previousWrappedPositionDeg(0.0f), previousCommandedPositionDeg(0.0f),
       velocityDegPerSec(0.0f), commandedVelocityDegPerSec(0.0f),
       previousVelocityErrorDegPerSec(0.0f), positionIntegralDegSec(0.0f),
-      velocityIntegralDeg(0.0f), outputPercent(0.0f),
-      encoderInitialized(false), controllerInitialized(false),
-      commandInitialized(false), velocityErrorInitialized(false),
-      positionOutputSaturated(false),
+      velocityIntegralDeg(0.0f), outputPercent(0.0f), encoderInitialized(false),
+      controllerInitialized(false), commandInitialized(false),
+      velocityErrorInitialized(false), positionOutputSaturated(false),
       outputSaturated(false) {}
 
 Arm::Arm(Motor &shoulderMotor, Motor &elbowMotor,
@@ -51,8 +47,7 @@ Arm::Arm(Motor &shoulderMotor, Motor &elbowMotor,
       shoulderEncoder_(&shoulderEncoder), elbowEncoder_(&elbowEncoder),
       config_(config), commandedAngles_(), targetPosition_(),
       commandedPosition_(), shoulderState_(), elbowState_(), telemetry_(),
-      lastUpdateUs_(0),
-      hasTarget_(false), cartesianTarget_(false),
+      lastUpdateUs_(0), hasTarget_(false), cartesianTarget_(false),
       cartesianPathInitialized_(false), cartesianPathComplete_(false),
       elbowUp_(false), atTarget_(false), gravityHoldActive_(false),
       gravityHoldSettledSinceUs_(0), gravityHoldAngles_(), faulted_(false) {}
@@ -180,8 +175,7 @@ bool Arm::update() {
     JointAngles nextAngles;
     if (!solveInverseKinematics(commandedPosition_, config_.shoulderLinkCm,
                                 config_.elbowLinkCm, elbowUp_, &nextAngles) ||
-        !fitAngleToRange(nextAngles.shoulderDeg,
-                         config_.shoulder.minAngleDeg,
+        !fitAngleToRange(nextAngles.shoulderDeg, config_.shoulder.minAngleDeg,
                          config_.shoulder.maxAngleDeg,
                          &nextAngles.shoulderDeg) ||
         !fitAngleToRange(nextAngles.elbowDeg, config_.elbow.minAngleDeg,
@@ -220,10 +214,10 @@ bool Arm::update() {
 
   const bool shoulderAtTarget =
       fabsf(telemetry_.shoulder.commandedPositionDeg - shoulderPositionDeg) <=
-          config_.shoulder.positionToleranceDeg;
+      config_.shoulder.positionToleranceDeg;
   const bool elbowAtTarget =
       fabsf(telemetry_.elbow.commandedPositionDeg - elbowPositionDeg) <=
-          config_.elbow.positionToleranceDeg;
+      config_.elbow.positionToleranceDeg;
   atTarget_ = shoulderAtTarget && elbowAtTarget &&
               (!cartesianTarget_ || cartesianPathComplete_);
   const bool velocitySettled =
@@ -247,8 +241,7 @@ bool Arm::update() {
       if (requiredSettleUs == 0 ||
           nowUs - gravityHoldSettledSinceUs_ >= requiredSettleUs) {
         gravityHoldActive_ = true;
-        gravityHoldAngles_ =
-            JointAngles(shoulderPositionDeg, elbowPositionDeg);
+        gravityHoldAngles_ = JointAngles(shoulderPositionDeg, elbowPositionDeg);
       }
     } else {
       gravityHoldSettledSinceUs_ = 0;
@@ -442,12 +435,10 @@ Arm::Position Arm::solveForwardKinematics(const JointAngles &angles,
                                           float shoulderLinkCm,
                                           float elbowLinkCm) {
   const float shoulderRad = angles.shoulderDeg * DEG_TO_RAD;
-  const float forearmRad =
-      (angles.shoulderDeg + angles.elbowDeg) * DEG_TO_RAD;
-  return Position(shoulderLinkCm * cosf(shoulderRad) +
-                      elbowLinkCm * cosf(forearmRad),
-                  shoulderLinkCm * sinf(shoulderRad) +
-                      elbowLinkCm * sinf(forearmRad));
+  const float forearmRad = (angles.shoulderDeg + angles.elbowDeg) * DEG_TO_RAD;
+  return Position(
+      shoulderLinkCm * cosf(shoulderRad) + elbowLinkCm * cosf(forearmRad),
+      shoulderLinkCm * sinf(shoulderRad) + elbowLinkCm * sinf(forearmRad));
 }
 
 bool Arm::readJointPosition(As5600Encoder *encoder, const JointConfig &config,
@@ -477,7 +468,7 @@ bool Arm::readJointPosition(As5600Encoder *encoder, const JointConfig &config,
 
 bool Arm::motorsEnabled() const {
   return config_.motorDisablePin < 0 ||
-         digitalRead(config_.motorDisablePin) == HIGH;
+         digitalRead(config_.motorDisablePin) == LOW;
 }
 
 void Arm::enterFault() {
@@ -543,14 +534,12 @@ float Arm::updateJoint(Motor *motor, const JointConfig &config,
         !state->positionOutputSaturated) {
       state->positionIntegralDegSec += positionError * dtSec;
     } else {
-      state->positionIntegralDegSec *=
-          clamp(config.integralDecay, 0.0f, 1.0f);
+      state->positionIntegralDegSec *= clamp(config.integralDecay, 0.0f, 1.0f);
     }
   }
-  state->positionIntegralDegSec =
-      clamp(state->positionIntegralDegSec,
-            -fabsf(config.positionIntegralLimitDegSec),
-            fabsf(config.positionIntegralLimitDegSec));
+  state->positionIntegralDegSec = clamp(
+      state->positionIntegralDegSec, -fabsf(config.positionIntegralLimitDegSec),
+      fabsf(config.positionIntegralLimitDegSec));
 
   float positionP = config.positionKp * positionError;
   float positionI = config.positionKi * state->positionIntegralDegSec;
@@ -564,16 +553,14 @@ float Arm::updateJoint(Motor *motor, const JointConfig &config,
   float targetVelocity =
       clamp(unclampedTargetVelocity, -fabsf(config.maxVelocityDegPerSec),
             fabsf(config.maxVelocityDegPerSec));
-  state->positionOutputSaturated =
-      targetVelocity != unclampedTargetVelocity;
+  state->positionOutputSaturated = targetVelocity != unclampedTargetVelocity;
   if (config.manualVelocityTestEnabled) {
     positionP = 0.0f;
     positionI = 0.0f;
     positionD = 0.0f;
-    targetVelocity =
-        clamp(config.manualTargetVelocityDegPerSec,
-              -fabsf(config.maxVelocityDegPerSec),
-              fabsf(config.maxVelocityDegPerSec));
+    targetVelocity = clamp(config.manualTargetVelocityDegPerSec,
+                           -fabsf(config.maxVelocityDegPerSec),
+                           fabsf(config.maxVelocityDegPerSec));
     state->positionOutputSaturated =
         targetVelocity != config.manualTargetVelocityDegPerSec;
   }
@@ -599,8 +586,7 @@ float Arm::updateJoint(Motor *motor, const JointConfig &config,
     state->velocityIntegralDeg *= clamp(config.integralDecay, 0.0f, 1.0f);
   }
   state->velocityIntegralDeg =
-      clamp(state->velocityIntegralDeg,
-            -fabsf(config.velocityIntegralLimitDeg),
+      clamp(state->velocityIntegralDeg, -fabsf(config.velocityIntegralLimitDeg),
             fabsf(config.velocityIntegralLimitDeg));
 
   float velocityP = config.velocityKp * velocityError;
@@ -634,13 +620,11 @@ float Arm::updateJoint(Motor *motor, const JointConfig &config,
   // Apply velocity and static-friction feedforward in the direction requested
   // by the cascaded controller.
   const bool commandMoving = fabsf(targetVelocity) > 0.01f;
-  const int motionDirection =
-      commandMoving ? directionSign(targetVelocity) : 0;
+  const int motionDirection = commandMoving ? directionSign(targetVelocity) : 0;
   float velocityFeedforward = 0.0f;
   float friction = 0.0f;
   if (feedbackEnabled && !config.constantPidTestEnabled && commandMoving) {
-    velocityFeedforward =
-        config.kVPercentPerDegPerSec * targetVelocity;
+    velocityFeedforward = config.kVPercentPerDegPerSec * targetVelocity;
     if (motionDirection > 0) {
       friction = fabsf(config.positiveStaticFrictionPercent);
     } else if (motionDirection < 0) {
@@ -651,18 +635,15 @@ float Arm::updateJoint(Motor *motor, const JointConfig &config,
   const float feedbackAndFeedforward =
       velocityPidOutput + velocityFeedforward + friction;
   const float unclamped = feedbackAndFeedforward + gravityPercent;
-  const float clampedOutput =
-      clamp(unclamped, -fabsf(config.maxPwmPercent),
-            fabsf(config.maxPwmPercent));
+  const float clampedOutput = clamp(unclamped, -fabsf(config.maxPwmPercent),
+                                    fabsf(config.maxPwmPercent));
   float output = clampedOutput;
   bool slewLimited = false;
   if (config.maxOutputSlewPercentPerSec > 0.0f) {
-    const float maxOutputChange =
-        config.maxOutputSlewPercentPerSec * dtSec;
+    const float maxOutputChange = config.maxOutputSlewPercentPerSec * dtSec;
     const int requestedDirection = directionSign(clampedOutput);
     const int previousDirection = directionSign(state->outputPercent);
-    const bool reversing = requestedDirection != 0 &&
-                           previousDirection != 0 &&
+    const bool reversing = requestedDirection != 0 && previousDirection != 0 &&
                            requestedDirection != previousDirection;
     const bool increasingMagnitude =
         fabsf(clampedOutput) > fabsf(state->outputPercent);
@@ -671,9 +652,8 @@ float Arm::updateJoint(Motor *motor, const JointConfig &config,
     // keeps driving against the PID's requested braking direction. Only ramp
     // up when continuing (or starting) in the same direction.
     if (!reversing && increasingMagnitude) {
-      const float limitedMagnitude =
-          min(fabsf(clampedOutput),
-              fabsf(state->outputPercent) + maxOutputChange);
+      const float limitedMagnitude = min(
+          fabsf(clampedOutput), fabsf(state->outputPercent) + maxOutputChange);
       output = requestedDirection * limitedMagnitude;
       slewLimited = output != clampedOutput;
     }
@@ -690,8 +670,7 @@ float Arm::updateJoint(Motor *motor, const JointConfig &config,
   telemetry->measuredPositionDeg = positionDeg;
   telemetry->measuredVelocityDegPerSec = state->velocityDegPerSec;
   telemetry->positionErrorDeg = positionError;
-  telemetry->trajectoryVelocityDegPerSec =
-      state->commandedVelocityDegPerSec;
+  telemetry->trajectoryVelocityDegPerSec = state->commandedVelocityDegPerSec;
   telemetry->targetVelocityDegPerSec = targetVelocity;
   telemetry->velocityErrorDegPerSec = velocityError;
   telemetry->positionPOutputDegPerSec = positionP;
