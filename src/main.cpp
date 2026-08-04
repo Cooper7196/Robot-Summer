@@ -57,7 +57,7 @@ constexpr uint8_t kTapeCalibrationPeakConfirmSamples = 1;
 constexpr float kTapeCalibrationProfileSpacingCm = 0.05f;
 constexpr uint16_t kTapeCalibrationMaxProfileSamples = 640;
 constexpr uint32_t kCalibrationSettleDelayMs = 250;
-constexpr float kMetalAnomalyThresholdHz = 110.0f;
+constexpr float kMetalAnomalyThresholdHz = 125.0f;
 constexpr float kMetalThresholdHighBatteryVoltage = 16.8f;
 constexpr float kMetalThresholdLowBatteryVoltage = 14.7f;
 constexpr float kMetalLowBatteryAnomalyThresholdHz = 60.0f;
@@ -110,8 +110,8 @@ constexpr float kElbowMinAngleDeg = -180.0f;
 constexpr float kElbowMaxAngleDeg = 180.0f;
 constexpr float clawOpenAngle = 40.0f;
 constexpr float clawHabitatOpenAngle = 115.0f;
-constexpr float clawClosedAngle = 105.0f;
-constexpr float clawFullyClosedAngle = 135.0f;
+constexpr float clawClosedAngle = 107.0f;
+constexpr float clawFullyClosedAngle = 137.0f;
 
 constexpr float kIdleLedBrightnessPercent = 50.0f;
 
@@ -1239,7 +1239,7 @@ void runPath() {
     driveTask.waitUntilMotionFinished(10000);
     driveTask.setTargetPose({-7.0f, 95.0f, -90.0f}, 1.0f, true);
     driveTask.waitUntilMotionFinished(10000);
-    armTask.setTargetPosition({29.5f, -2.5f}, true);
+    armTask.setTargetPosition({29.5f, -3.5f}, true);
     armTask.waitUntilSettled(1000);
     driveTask.setTargetPose({-3.0, 95.0f, -90.0f}, 0.25f);
     driveTask.waitUntilMotionFinished(10000);
@@ -1283,11 +1283,11 @@ void runPath() {
 
   // Move to scanning position for rock 2
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-23, 187, 20.0f}, 1.0f);
+  driveTask.setTargetPose({-23, 192, 20.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
   teletubbyFoundAtRock = checkForTeletubby();
   // Move to second scanning position for rock 2
-  driveTask.setTargetPose({-30, 185, 20.0f}, 1.0f);
+  driveTask.setTargetPose({-30, 190, 20.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
   if (!teletubbyFoundAtRock) {
     checkForTeletubby();
@@ -1295,8 +1295,10 @@ void runPath() {
 
   // Grab left rock if it is metal
   if (leftRockMetal) {
+    driveTask.setTargetPose({-30, 185, 20.0f}, 1.0f);
     armTask.setTargetPosition({29.5f, 5.0f}, true);
     servo1.setAngle(clawOpenAngle);
+    driveTask.waitUntilMotionFinished(10000);
     driveTask.setTargetPose({-15, 184, 61.0f}, 1.0f, true);
     driveTask.waitUntilMotionFinished(10000);
     armTask.setTargetPosition({29.5f, -2.5f}, true);
@@ -1338,7 +1340,7 @@ void runPath() {
   driveTask.waitUntilMotionFinished(10000);
   teletubbyFoundAtRock = checkForTeletubby();
   // Move to second scanning position for rock 4
-  driveTask.setTargetPose({-45.0f, 181.0f, -125.0f}, 1.0f);
+  driveTask.setTargetPose({-55.0f, 171.0f, -140.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
   if (!teletubbyFoundAtRock) {
     checkForTeletubby();
@@ -1421,7 +1423,7 @@ void runPath() {
   driveTask.waitUntilMotionFinished(10000);
 
   // Run tape calibration
-  float tapePosition = (firstField ? 4.0f : 3.0f);
+  float tapePosition = (firstField ? 4.0f : 4.0f);
   while (!calibrateYWithMiddleTapeSensor(tapePosition, 1.0f, 0.09f)) {
     driveTask.setTargetPose({-130.0f, 0.0f, -90.0f}, 1.0f);
     driveTask.waitUntilMotionFinished(10000);
@@ -1489,9 +1491,9 @@ void runPath() {
   // Run habitat tape calibration
   tapePosition = (firstField ? -151.7f : -149.5f);
   const float habitatX = firstField ? -155.75f : -155.4f;
-  const float habitatY = firstField ? 137.5f : 139.0f;
+  const float habitatY = firstField ? 137.5f : 138.5f;
 
-  while (!calibrateXWithMiddleTapeSensor(tapePosition, -1.0f, 0.08f)) {
+  while (!calibrateXWithMiddleTapeSensor(tapePosition, -1.0f, 0.09f)) {
     driveTask.setTargetPose({-137.0f, 160.5f, 0.0f}, 0.3f);
     driveTask.waitUntilMotionFinished(10000);
   }
@@ -1509,7 +1511,7 @@ void runPath() {
     driveTask.setTargetPose({-180.5f, 162.0f, 0.0f}, 0.3f);
     servo1.setAngle(clawFullyClosedAngle);
     armTask.setTargetPosition({28.0f, -8.0f}, true);
-    driveTask.waitUntilMotionFinished(2250);
+    driveTask.waitUntilMotionFinished(1500);
     delay(500);
 
     // Move into first habitat
@@ -1517,14 +1519,14 @@ void runPath() {
     driveTask.waitUntilMotionFinished(10000);
   } else {
     armTask.setTargetPosition({26.5f, -5.0f}, true);
-    driveTask.setTargetPose({currentPose.xCm, 159.0f, 0.0f}, 0.3f);
+    driveTask.setTargetPose({currentPose.xCm, 159.5f, 0.0f}, 0.3f);
     driveTask.waitUntilMotionFinished(1000);
     delay(500);
     // Move to first habitat position
-    driveTask.setTargetPose({-178.5f, 159.0f, 0.0f}, 0.3f);
+    driveTask.setTargetPose({-178.5f, 159.5f, 0.0f}, 0.3f);
     servo1.setAngle(clawFullyClosedAngle);
     armTask.setTargetPosition({28.0f, -8.0f}, true);
-    driveTask.waitUntilMotionFinished(2250);
+    driveTask.waitUntilMotionFinished(1500);
     delay(500);
 
     // Move into first habitat
@@ -1558,26 +1560,42 @@ void runPath() {
   servo1.setAngle(clawFullyClosedAngle);
   delay(300);
   // Robot wiggle
-  driveTask.setTargetPose({habitatX, 138.5f, 85.0f}, 0.3f);
+  driveTask.setTargetPose({habitatX + 1.0f, 138.5f, 85.0f}, 0.3f);
   delay(300);
-  driveTask.setTargetPose({habitatX, 138.5f, 95.0f}, 0.3f);
+  driveTask.setTargetPose({habitatX + 1.0f, 138.5f, 95.0f}, 0.3f);
   delay(300);
-
-  // Backout and rotate habitats
-  driveTask.setTargetPose({habitatX + 8.0f, 138.5f, 90.0f}, 0.3f);
-  driveTask.waitUntilMotionFinished(10000);
-  armTask.setTargetPosition({28.0f, -5.0f}, true);
-  driveTask.setTargetPose({habitatX + 8.0f, 148.5f, 90.0f}, 0.3f, true);
-  driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({habitatX - 2.5f, 148.5f, 90.0f}, 0.3f, true);
-  driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({habitatX - 1.5f, 126.5f, 90.0f}, 0.3f, true);
-  driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({habitatX + 12.0f, 126.5f, 90.0f}, 0.3f);
-  driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({habitatX + 12.0f, 138.5f, 0.0f}, 0.3f, true);
-  driveTask.waitUntilMotionFinished(10000);
-
+  driveTask.setTargetPose({habitatX + 1.0f, 138.5f, 90.0f}, 0.3f);
+  delay(350);
+  if (firstField) {
+    // Backout and rotate habitats
+    driveTask.setTargetPose({habitatX + 8.0f, 138.5f, 90.0f}, 0.3f);
+    driveTask.waitUntilMotionFinished(10000);
+    armTask.setTargetPosition({28.0f, -5.0f}, true);
+    driveTask.setTargetPose({habitatX + 8.0f, 150.0f, 90.0f}, 0.3f, true);
+    driveTask.waitUntilMotionFinished(10000);
+    driveTask.setTargetPose({habitatX - 2.5f, 150.0f, 90.0f}, 0.3f, true);
+    driveTask.waitUntilMotionFinished(10000);
+    driveTask.setTargetPose({habitatX - 1.5f, 126.5f, 90.0f}, 0.3f, true);
+    driveTask.waitUntilMotionFinished(10000);
+    driveTask.setTargetPose({habitatX + 12.0f, 126.5f, 90.0f}, 0.3f);
+    driveTask.waitUntilMotionFinished(10000);
+    driveTask.setTargetPose({habitatX + 12.0f, 138.5f, 0.0f}, 0.3f, true);
+    driveTask.waitUntilMotionFinished(10000);
+  } else {
+    driveTask.setTargetPose({habitatX + 9.0f, 138.5f, 90.0f}, 0.3f);
+    driveTask.waitUntilMotionFinished(10000);
+    driveTask.setTargetPose({habitatX + 9.0f, 150.0f, 90.0f}, 0.3f, true);
+    driveTask.waitUntilMotionFinished(10000);
+    armTask.setTargetPosition({28.0f, -5.0f}, true);
+    driveTask.setTargetPose({habitatX - 1.5f, 150.0f, 90.0f}, 0.3f, true);
+    driveTask.waitUntilMotionFinished(10000);
+    driveTask.setTargetPose({habitatX - 0.5f, 126.5f, 90.0f}, 0.3f, true);
+    driveTask.waitUntilMotionFinished(10000);
+    driveTask.setTargetPose({habitatX + 13.0f, 126.5f, 90.0f}, 0.3f);
+    driveTask.waitUntilMotionFinished(10000);
+    driveTask.setTargetPose({habitatX + 13.0f, 138.5f, 0.0f}, 0.3f, true);
+    driveTask.waitUntilMotionFinished(10000);
+  }
   // Allign to second habitat
   driveTask.setTargetPose({-142.5f, 162.0f, 0.0f}, 0.3f);
   driveTask.waitUntilMotionFinished(10000);
@@ -1607,17 +1625,19 @@ void runPath() {
   servo1.setAngle(clawFullyClosedAngle);
   delay(300);
   // Robot wiggle
-  driveTask.setTargetPose({habitatX, 138.5f, 85.0f}, 0.3f);
+  driveTask.setTargetPose({habitatX + 1.0f, 138.5f, 85.0f}, 0.3f);
   delay(300);
-  driveTask.setTargetPose({habitatX, 138.5f, 95.0f}, 0.3f);
+  driveTask.setTargetPose({habitatX + 1.0f, 138.5f, 95.0f}, 0.3f);
   delay(300);
+  driveTask.setTargetPose({habitatX + 1.0f, 138.5f, 90.0f}, 0.3f);
+  delay(350);
   // backout and rotate habitats
   driveTask.setTargetPose({habitatX + 8.0f, 138.5f, 90.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
-  armTask.setTargetPosition({28.0f, -5.0f}, true);
-  driveTask.setTargetPose({habitatX + 8.0f, 148.5f, 90.0f}, 0.3f, true);
+  driveTask.setTargetPose({habitatX + 8.0f, 150.0f, 90.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({habitatX - 2.5f, 148.5f, 90.0f}, 0.3f, true);
+  armTask.setTargetPosition({28.0f, -5.0f}, true);
+  driveTask.setTargetPose({habitatX - 2.5f, 150.0f, 90.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({habitatX - 1.5f, 126.5f, 90.0f}, 0.3f);
   driveTask.waitUntilMotionFinished(10000);
@@ -1635,13 +1655,13 @@ void runPath() {
     driveTask.setTargetPose({-161.5f, 170.0f, 0.0f}, 0.1f);
     driveTask.waitUntilMotionFinished(10000);
   } else {
-    driveTask.setTargetPose({-162.5f, 161.0f, 0.0f}, 0.3);
+    driveTask.setTargetPose({-161.5f, 161.0f, 0.0f}, 0.3);
     driveTask.waitUntilMotionFinished(10000);
     armTask.setTargetPosition({28.0f, -8.0f}, true);
     armTask.waitUntilSettled(500);
     delay(500);
     // Move into third habitat
-    driveTask.setTargetPose({-162.5f, 170.0f, 0.0f}, 0.1f);
+    driveTask.setTargetPose({-161.5f, 170.0f, 0.0f}, 0.1f);
     driveTask.waitUntilMotionFinished(10000);
   }
   // Lift arm and open claw
@@ -1663,19 +1683,21 @@ void runPath() {
   servo1.setAngle(clawFullyClosedAngle);
   delay(300);
   // Robot wiggle
-  driveTask.setTargetPose({habitatX, 138.5f, 85.0f}, 0.3f);
+  driveTask.setTargetPose({habitatX + 1.0f, 138.5f, 85.0f}, 0.3f);
   delay(300);
-  driveTask.setTargetPose({habitatX, 138.5f, 95.0f}, 0.3f);
+  driveTask.setTargetPose({habitatX + 1.0f, 138.5f, 95.0f}, 0.3f);
   delay(300);
+  driveTask.setTargetPose({habitatX + 1.0f, 138.5f, 90.0f}, 0.3f);
+  delay(350);
   // backout and rotate habitats
   driveTask.setTargetPose({habitatX + 8.5f, 138.5f, 90.0f}, 0.3f);
   driveTask.waitUntilMotionFinished(10000);
-  armTask.setTargetPosition({28.0f, -5.0f}, true);
   driveTask.setTargetPose({habitatX + 8.0f, 138.5f, 90.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({habitatX + 8.0f, 148.5f, 90.0f}, 0.3f, true);
+  armTask.setTargetPosition({28.0f, -5.0f}, true);
+  driveTask.setTargetPose({habitatX + 8.0f, 150.0f, 90.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({habitatX - 2.5f, 148.5f, 90.0f}, 0.3f, true);
+  driveTask.setTargetPose({habitatX - 2.5f, 150.0f, 90.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({habitatX - 1.5f, 126.5f, 90.0f}, 0.3f);
   driveTask.waitUntilMotionFinished(10000);
@@ -1692,12 +1714,12 @@ void runPath() {
     driveTask.setTargetPose({-124.9f, 170.0f, 0.0f}, 0.1f);
     driveTask.waitUntilMotionFinished(10000);
   } else {
-    driveTask.setTargetPose({-125.9f, 162.0f, 0.0f}, 0.3f);
+    driveTask.setTargetPose({-124.9f, 162.0f, 0.0f}, 0.3f);
     driveTask.waitUntilMotionFinished(10000);
     armTask.setTargetPosition({28.0f, -8.0f}, true);
     armTask.waitUntilSettled(1000);
     // Move into fourth habitat
-    driveTask.setTargetPose({-125.9f, 170.0f, 0.0f}, 0.1f);
+    driveTask.setTargetPose({-124.9f, 170.0f, 0.0f}, 0.1f);
     driveTask.waitUntilMotionFinished(10000);
   }
   // Lift arm and open claw
@@ -1722,19 +1744,20 @@ void runPath() {
   servo1.setAngle(clawFullyClosedAngle);
   delay(300);
   // Robot wiggle
-  driveTask.setTargetPose({habitatX, 138.5f, 85.0f}, 0.3f);
+  driveTask.setTargetPose({habitatX - 1.0f, 138.5f, 85.0f}, 0.3f);
   delay(300);
-  driveTask.setTargetPose({habitatX, 138.5f, 95.0f}, 0.3f);
-  delay(400);
+  driveTask.setTargetPose({habitatX - 1.0f, 138.5f, 95.0f}, 0.3f);
+  delay(300);
+  driveTask.setTargetPose({habitatX - 1.0f, 138.5f, 90.0f}, 0.3f);
+  delay(300);
   // backout
-  driveTask.setTargetPose({habitatX + 12.5f, 138.5f, 90.0f}, 0.3f, true);
+  driveTask.setTargetPose({habitatX + 15.5f, 138.5f, 90.0f}, 0.3f, true);
   driveTask.waitUntilMotionFinished(10000);
-  armTask.setTargetPosition({25.5, 6.0}, true);
-  servo1.setAngle(clawOpenAngle);
 
   // Drive to solar panel pickup position
-  armTask.setTargetPosition({27.0, 5.5}, true);
+  armTask.setTargetPosition({27.0, 7.0}, true);
   driveTask.setTargetPose({-144.0f, 96.0f, -90.0f}, 1.0f, true);
+  servo1.setAngle(clawOpenAngle);
   driveTask.waitUntilMotionFinished(10000);
   driveTask.setTargetPose({-129.0f, 96.0f, -90.0f}, 0.1f);
   driveTask.waitUntilMotionFinished(3000);
@@ -1745,7 +1768,7 @@ void runPath() {
     armTask.setTargetPosition({25.5, 6.0}, true);
     armTask.waitUntilSettled(500);
   }
-
+  delay(1000);
   // Grab solar panel
   servo1.setAngle(clawFullyClosedAngle);
   delay(750);
