@@ -17,7 +17,8 @@ DriveTask::DriveTask(MecanumDrive &drive, OtosSensor &otos)
       commandQueue_(nullptr), taskHandle_(nullptr), currentPose_(),
       currentPoseTimestampMs_(0),
       poseValid_(false), busy_(false), atTarget_(false),
-      calibrationInProgress_(false), calibrationSucceeded_(false) {}
+      calibrationInProgress_(false), calibrationSucceeded_(false),
+      manualControlRequested_(false), manualControlActive_(false) {}
 
 bool DriveTask::begin(SemaphoreHandle_t pwmMutex, uint32_t stackSize,
                       UBaseType_t priority) {
@@ -183,6 +184,45 @@ void DriveTask::cancel() {
   updateStatus(false, false);
 }
 
+bool DriveTask::beginManualControl(uint32_t timeoutMs) {
+  if (commandQueue_ == nullptr || stateMutex_ == nullptr || timeoutMs == 0) {
+    return false;
+  }
+
+  // Discard any pose command which could otherwise run after manual control.
+  xQueueReset(commandQueue_);
+  xSemaphoreTake(stateMutex_, portMAX_DELAY);
+  manualControlRequested_ = true;
+  xSemaphoreGive(stateMutex_);
+  updateStatus(false, false);
+
+  const uint32_t startMs = millis();
+  for (;;) {
+    xSemaphoreTake(stateMutex_, portMAX_DELAY);
+    const bool active = manualControlActive_;
+    xSemaphoreGive(stateMutex_);
+    if (active) {
+      return true;
+    }
+    if (millis() - startMs >= timeoutMs) {
+      xSemaphoreTake(stateMutex_, portMAX_DELAY);
+      manualControlRequested_ = false;
+      xSemaphoreGive(stateMutex_);
+      return false;
+    }
+    vTaskDelay(1);
+  }
+}
+
+void DriveTask::endManualControl() {
+  if (stateMutex_ == nullptr) {
+    return;
+  }
+  xSemaphoreTake(stateMutex_, portMAX_DELAY);
+  manualControlRequested_ = false;
+  xSemaphoreGive(stateMutex_);
+}
+
 void DriveTask::taskEntry(void *context) {
   static_cast<DriveTask *>(context)->run();
 }
@@ -192,6 +232,26 @@ void DriveTask::run() {
   uint32_t lastPoseLogMs = 0;
   uint32_t lastStalePoseLogMs = 0;
   for (;;) {
+    xSemaphoreTake(stateMutex_, portMAX_DELAY);
+    const bool manualRequested = manualControlRequested_;
+    bool manualActive = manualControlActive_;
+    xSemaphoreGive(stateMutex_);
+
+    if (manualRequested && !manualActive) {
+      xSemaphoreTake(pwmMutex_, portMAX_DELAY);
+      drive_->cancelPoseTarget();
+      xSemaphoreGive(pwmMutex_);
+      xSemaphoreTake(stateMutex_, portMAX_DELAY);
+      manualControlActive_ = true;
+      xSemaphoreGive(stateMutex_);
+      manualActive = true;
+    } else if (!manualRequested && manualActive) {
+      xSemaphoreTake(stateMutex_, portMAX_DELAY);
+      manualControlActive_ = false;
+      xSemaphoreGive(stateMutex_);
+      manualActive = false;
+    }
+
     // Poll the physical enable switch independently of motion commands. The
     // PWM expander retains its last duty cycle while the drive is otherwise
     // idle, including after an intermediary waypoint.
@@ -200,7 +260,7 @@ void DriveTask::run() {
     xSemaphoreGive(pwmMutex_);
 
     Command command;
-    if (xQueueReceive(commandQueue_, &command, 0) == pdTRUE) {
+    if (!manualActive && xQueueReceive(commandQueue_, &command, 0) == pdTRUE) {
       if (command.type == CommandType::TargetPose) {
         drive_->setTargetPose(command.pose, command.maxPower,
                               command.intermediaryPosition,
@@ -267,7 +327,10 @@ void DriveTask::run() {
       }
     }
 
-    if (!poseValid) {
+    if (manualActive) {
+      // The caller owns wheel output until endManualControl(). Keep updating
+      // the pose snapshot, but do not stop or update the pose controller.
+    } else if (!poseValid) {
       xSemaphoreTake(pwmMutex_, portMAX_DELAY);
       drive_->stop();
       drive_->resetPosePid();

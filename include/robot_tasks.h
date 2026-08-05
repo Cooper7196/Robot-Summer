@@ -40,6 +40,11 @@ public:
   // Blocks until the current motion finishes or timeoutMs elapses.
   bool waitUntilMotionFinished(uint32_t timeoutMs) const;
   void cancel();
+  // Hands exclusive drivetrain-output ownership to the caller. The drive task
+  // acknowledges the handoff only after cancelling and stopping its pose
+  // controller, so it cannot later overwrite a direct motor command.
+  bool beginManualControl(uint32_t timeoutMs = 100);
+  void endManualControl();
 
 private:
   enum class CommandType : uint8_t {
@@ -84,6 +89,8 @@ private:
   bool atTarget_;
   bool calibrationInProgress_;
   bool calibrationSucceeded_;
+  bool manualControlRequested_;
+  bool manualControlActive_;
 };
 
 class ArmTask {
