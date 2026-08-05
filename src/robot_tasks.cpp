@@ -40,14 +40,16 @@ bool DriveTask::setTargetPose(const OtosSensor::Pose &targetPose,
                               float maxPower, bool intermediaryPosition,
                               float maxHeadingPower, float minHeadingPower,
                               float headingToleranceDeg,
-                              float crossTrackKp) {
+                              float crossTrackKp,
+                              float crossTrackMaxPower) {
   if (commandQueue_ == nullptr) {
     return false;
   }
 
   Command command{CommandType::TargetPose, targetPose, maxPower,
                   intermediaryPosition, maxHeadingPower, minHeadingPower,
-                  headingToleranceDeg, crossTrackKp, 0.0f, 0.0f, 0};
+                  headingToleranceDeg, crossTrackKp, crossTrackMaxPower, 0.0f,
+                  0.0f, 0};
   const bool queued = xQueueSendToBack(commandQueue_, &command, 0) == pdPASS;
   if (queued) {
     updateStatus(true, false);
@@ -63,8 +65,8 @@ bool DriveTask::setMotionTolerance(float positionToleranceCm,
   }
 
   Command command{CommandType::SetMotionTolerance, OtosSensor::Pose(), 0.0f,
-                  false, -1.0f, 0.0f, -1.0f, 0.0f, positionToleranceCm,
-                  headingToleranceDeg, 0};
+                  false, -1.0f, 0.0f, -1.0f, 0.0f, -1.0f,
+                  positionToleranceCm, headingToleranceDeg, 0};
   return xQueueSendToBack(commandQueue_, &command, 0) == pdPASS;
 }
 
@@ -73,7 +75,7 @@ bool DriveTask::setOtosPose(const OtosSensor::Pose &currentPose) {
     return false;
   }
   Command command{CommandType::SetCurrentPose, currentPose, 0.0f, false, -1.0f,
-                  0.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0};
+                  0.0f, -1.0f, 0.0f, -1.0f, 0.0f, 0.0f, 0};
   return xQueueSendToBack(commandQueue_, &command, 0) == pdPASS;
 }
 
@@ -118,7 +120,8 @@ bool DriveTask::calibrateImuBlocking(uint32_t durationMs) {
   xSemaphoreGive(stateMutex_);
 
   Command command{CommandType::CalibrateImu, OtosSensor::Pose(), 0.0f, false,
-                  -1.0f, 0.0f, -1.0f, 0.0f, 0.0f, 0.0f, sampleCount};
+                  -1.0f, 0.0f, -1.0f, 0.0f, -1.0f, 0.0f, 0.0f,
+                  sampleCount};
   if (xQueueSendToBack(commandQueue_, &command, 0) != pdPASS) {
     xSemaphoreTake(stateMutex_, portMAX_DELAY);
     calibrationInProgress_ = false;
@@ -174,7 +177,7 @@ void DriveTask::cancel() {
     return;
   }
   Command command{CommandType::Cancel, OtosSensor::Pose(), 0.0f, false, -1.0f,
-                  0.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0};
+                  0.0f, -1.0f, 0.0f, -1.0f, 0.0f, 0.0f, 0};
   xQueueReset(commandQueue_);
   xQueueSendToBack(commandQueue_, &command, 0);
   updateStatus(false, false);
@@ -204,7 +207,8 @@ void DriveTask::run() {
                               command.maxHeadingPower,
                               command.minHeadingPower,
                               command.targetHeadingToleranceDeg,
-                              command.crossTrackKp);
+                              command.crossTrackKp,
+                              command.crossTrackMaxPower);
         updateStatus(true, false);
       } else if (command.type == CommandType::SetCurrentPose) {
         const bool set = otos_->setPose(command.pose);

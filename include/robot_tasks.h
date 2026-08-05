@@ -21,7 +21,8 @@ public:
                      float maxHeadingPower = -1.0f,
                      float minHeadingPower = 0.0f,
                      float headingToleranceDeg = -1.0f,
-                     float crossTrackKp = 0.0f);
+                     float crossTrackKp = 0.0f,
+                     float crossTrackMaxPower = -1.0f);
   // Applies to subsequent updates of the current motion as well as future
   // motions. Position is in centimetres and heading is in degrees.
   bool setMotionTolerance(float positionToleranceCm,
@@ -58,6 +59,7 @@ private:
     float minHeadingPower;
     float targetHeadingToleranceDeg;
     float crossTrackKp;
+    float crossTrackMaxPower;
     float positionToleranceCm;
     float headingToleranceDeg;
     uint32_t gyroCalibrationSamples;

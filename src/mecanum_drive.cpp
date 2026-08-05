@@ -13,6 +13,7 @@ MecanumDrive::MecanumDrive(Motor &frontLeft, Motor &frontRight, Motor &backLeft,
       targetMinHeadingPower_(0.0f),
       targetHeadingToleranceDeg_(POSE_HEADING_TOLERANCE_DEG),
       targetCrossTrackKp_(0.0f),
+      targetCrossTrackMaxPower_(1.0f),
       positionToleranceCm_(POSE_POSITION_TOLERANCE_CM),
       headingToleranceDeg_(POSE_HEADING_TOLERANCE_DEG),
       targetIsIntermediary_(false), hasPoseTarget_(false),
@@ -49,7 +50,8 @@ void MecanumDrive::setTargetPose(const OtosSensor::Pose &targetPose,
                                  float maxHeadingPower,
                                  float minHeadingPower,
                                  float headingToleranceDeg,
-                                 float crossTrackKp) {
+                                 float crossTrackKp,
+                                 float crossTrackMaxPower) {
   targetPose_ = targetPose;
   targetMaxPower_ = clamp(maxPower, 0.0f, 1.0f);
   targetMaxHeadingPower_ =
@@ -60,6 +62,10 @@ void MecanumDrive::setTargetPose(const OtosSensor::Pose &targetPose,
   targetHeadingToleranceDeg_ =
       headingToleranceDeg > 0.0f ? headingToleranceDeg : headingToleranceDeg_;
   targetCrossTrackKp_ = fmaxf(crossTrackKp, 0.0f);
+  targetCrossTrackMaxPower_ =
+      crossTrackMaxPower > 0.0f
+          ? clamp(crossTrackMaxPower, 0.0f, 1.0f)
+          : targetMaxPower_;
   targetIsIntermediary_ = intermediaryPosition;
   hasPoseTarget_ = true;
   atPoseTarget_ = false;
@@ -101,7 +107,7 @@ bool MecanumDrive::updatePoseTarget(const OtosSensor::Pose &currentPose) {
   if (updateDriveToPose(currentPose, targetPose_, targetMaxPower_,
                         targetIsIntermediary_, targetMaxHeadingPower_,
                         targetMinHeadingPower_, targetHeadingToleranceDeg_,
-                        targetCrossTrackKp_)) {
+                        targetCrossTrackKp_, targetCrossTrackMaxPower_)) {
     hasPoseTarget_ = false;
     atPoseTarget_ = true;
   }
@@ -161,7 +167,7 @@ bool MecanumDrive::driveToPose(OtosSensor &otosSensor,
 
     if (updateDriveToPose(currentPose, targetPose, maxPower,
                           intermediaryPosition, maxPower, 0.0f,
-                          headingToleranceDeg_, 0.0f)) {
+                          headingToleranceDeg_, 0.0f, maxPower)) {
       return true;
     }
 
@@ -176,7 +182,8 @@ bool MecanumDrive::updateDriveToPose(const OtosSensor::Pose &currentPose,
                                      float maxHeadingPower,
                                      float minHeadingPower,
                                      float headingToleranceDeg,
-                                     float crossTrackKp) {
+                                     float crossTrackKp,
+                                     float crossTrackMaxPower) {
   const uint32_t nowMs = millis();
   const float dtSec =
       lastPosePidMs_ != 0 ? (nowMs - lastPosePidMs_) / 1000.0f : 0.0f;
@@ -273,8 +280,9 @@ bool MecanumDrive::updateDriveToPose(const OtosSensor::Pose &currentPose,
     const float crossTrackError =
         (currentFromStartX * pathNormalX) +
         (currentFromStartY * pathNormalY);
-    const float correctionPower =
-        clamp(-crossTrackKp * crossTrackError, -maxPower, maxPower);
+    const float correctionPower = clamp(-crossTrackKp * crossTrackError,
+                                        -crossTrackMaxPower,
+                                        crossTrackMaxPower);
     crossTrackCorrectionX = correctionPower * pathNormalX;
     crossTrackCorrectionY = correctionPower * pathNormalY;
   }
@@ -317,8 +325,28 @@ bool MecanumDrive::updateDriveToPose(const OtosSensor::Pose &currentPose,
     }
   }
 
-  if (translationCommandMagnitude > maxPower &&
-      translationCommandMagnitude > 0.0f) {
+  if (pathLength > 0.001f && crossTrackMaxPower > maxPower) {
+    // Calibration deliberately uses a slow along-track command but needs a
+    // stronger perpendicular command to overcome uneven wheel friction. Cap
+    // the two components independently so the final magnitude clamp does not
+    // throw away the cross-track correction.
+    const float pathUnitX = pathX / pathLength;
+    const float pathUnitY = pathY / pathLength;
+    const float pathNormalX = -pathUnitY;
+    const float pathNormalY = pathUnitX;
+    float alongTrackCommand =
+        (xCommand * pathUnitX) + (yCommand * pathUnitY);
+    float crossTrackCommand =
+        (xCommand * pathNormalX) + (yCommand * pathNormalY);
+    alongTrackCommand = clamp(alongTrackCommand, -maxPower, maxPower);
+    crossTrackCommand =
+        clamp(crossTrackCommand, -crossTrackMaxPower, crossTrackMaxPower);
+    xCommand = (alongTrackCommand * pathUnitX) +
+               (crossTrackCommand * pathNormalX);
+    yCommand = (alongTrackCommand * pathUnitY) +
+               (crossTrackCommand * pathNormalY);
+  } else if (translationCommandMagnitude > maxPower &&
+             translationCommandMagnitude > 0.0f) {
     const float translationScale = maxPower / translationCommandMagnitude;
     xCommand *= translationScale;
     yCommand *= translationScale;
