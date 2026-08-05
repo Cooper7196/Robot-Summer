@@ -67,10 +67,10 @@ constexpr uint32_t kCalibrationSettleDelayMs = 250;
 constexpr float kTapeCalibrationMaxCrossTrackDriftCm = 2.0f;
 constexpr float kTapeCalibrationMaxHeadingDriftDeg = 3.0f;
 constexpr float kTapeCalibrationMaxSensorCenterSpreadCm = 1.0f;
-constexpr float kMetalAnomalyThresholdHz = 125.0f;
+constexpr float kMetalAnomalyThresholdHz = 200.0f;
 constexpr float kMetalThresholdHighBatteryVoltage = 16.8f;
 constexpr float kMetalThresholdLowBatteryVoltage = 14.8f;
-constexpr float kMetalLowBatteryAnomalyThresholdHz = 100.0f;
+constexpr float kMetalLowBatteryAnomalyThresholdHz = 175.0f;
 constexpr uint8_t kMetalDeviationAverageSamples = 5;
 // Calibrated against a 16.20 V multimeter reading (ADC initially reported
 // 15.77 V with the nominal 6.5:1 divider ratio).
@@ -1398,9 +1398,9 @@ void runPath() {
   driveTask.waitUntilMotionFinished(10000);
   teletubbyFoundAtRock = checkForTeletubby();
   // Move to second scanning position for rock 4
-  driveTask.setTargetPose({-45.0f, 170.0f, -180.0f}, 1.0f, true);
+  driveTask.setTargetPose({-45.0f, 170.0f, -180.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
-  driveTask.setTargetPose({-72.0f, 172.0f, -180.0f}, 1.0f);
+  driveTask.setTargetPose({-70.0f, 170.0f, -180.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(10000);
   if (!teletubbyFoundAtRock) {
     checkForTeletubby();
@@ -1560,7 +1560,7 @@ void runPath() {
   const float habitatX = firstField ? -155.75f : -155.4f;
   const float habitatY = firstField ? 137.5f : 138.5f;
 
-  while (!calibrateXWithMiddleTapeSensor(tapePosition, -1.0f, 0.09f)) {
+  while (!calibrateXWithMiddleTapeSensor(tapePosition, -1.0f, 0.15f)) {
     driveTask.setTargetPose({-137.0f, 160.0f, 0.0f}, 0.3f);
     driveTask.waitUntilMotionFinished(10000);
   }
@@ -1856,9 +1856,11 @@ void runPath() {
   }
   driveTask.waitUntilMotionFinished(10000);
 
+  Arm::Position solarPanelPickupPosition =
+      firstField ? Arm::Position{27.0f, 5.5f} : Arm::Position{26.5f, 6.0f};
   // Drive to solar panel pickup position
   driveTask.setTargetPose({-144.0f, 96.0f, -90.0f}, 1.0f, true);
-  armTask.setTargetPosition({26.5, 6.0}, true);
+  armTask.setTargetPosition(solarPanelPickupPosition, true);
   driveTask.waitUntilMotionFinished(10000);
   servo1.setAngle(clawOpenAngle);
   if (firstField) {
@@ -1867,14 +1869,10 @@ void runPath() {
     driveTask.setTargetPose({-131.0f, 96.0f, -90.0f}, 0.1f);
   }
   driveTask.waitUntilMotionFinished(3000);
-  if (firstField) {
-    armTask.setTargetPosition({27.5, 6.0}, true);
-    armTask.waitUntilSettled(500);
-  } else {
-    armTask.setTargetPosition({26.5, 6.0}, true);
-    armTask.waitUntilSettled(500);
-  }
+  armTask.setTargetPosition(solarPanelPickupPosition, true);
+  armTask.waitUntilSettled(500);
   // Grab solar panel
+  delay(500);
   servo1.setAngle(clawFullyClosedAngle);
   delay(750);
   driveTask.setTargetPose({-160.0f, 94.0f, -90.0f}, 1.0f);
@@ -2070,7 +2068,7 @@ void setup() {
 
   runPath();
 
-  while (false) {
+  while (true) {
     MetalDetector::Reading detectorLeftReading;
     MetalDetector::Reading detectorRightReading;
     const bool detectorLeftValid =
