@@ -1403,7 +1403,8 @@ void runPath() {
 
   // Move to scanning position for rock 2
   driveTask.waitUntilMotionFinished(5000);
-  driveTask.setTargetPose({-23, 192, 20.0f}, 1.0f);
+  driveTask.setTargetPose({-23.0
+    , 188, 20.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(5000);
   teletubbyFoundAtRock = checkForTeletubby(true);
   // Move to second scanning position for rock 2
@@ -1925,7 +1926,7 @@ void runPath() {
   if (firstField) {
     driveTask.setTargetPose({-131.0f, 96.0f, -90.0f}, 0.15f);
   } else {
-    driveTask.setTargetPose({-132.5f, 94.0f, -90.0f}, 0.15f);
+    driveTask.setTargetPose({-131.5f, 94.0f, -90.0f}, 0.15f);
   }
   driveTask.waitUntilMotionFinished(3000);
   driveTask.cancel();
