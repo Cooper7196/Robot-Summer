@@ -102,6 +102,8 @@ public:
   bool setTargetAngles(const Arm::JointAngles &targetAngles);
   bool setTargetPosition(const Arm::Position &targetPosition,
                          bool elbowUp = false);
+  // Applies the same position tolerance to both joints, in degrees.
+  bool setPositionTolerance(float toleranceDeg);
   bool getCurrentAngles(Arm::JointAngles *currentAngles) const;
   bool getTelemetry(Arm::Telemetry *telemetry) const;
   bool isBusy() const;
@@ -114,13 +116,19 @@ public:
   void cancel();
 
 private:
-  enum class CommandType : uint8_t { TargetAngles, TargetPosition, Cancel };
+  enum class CommandType : uint8_t {
+    TargetAngles,
+    TargetPosition,
+    SetPositionTolerance,
+    Cancel
+  };
 
   struct Command {
     CommandType type;
     Arm::JointAngles angles;
     Arm::Position position;
     bool elbowUp;
+    float toleranceDeg;
   };
 
   static void taskEntry(void *context);

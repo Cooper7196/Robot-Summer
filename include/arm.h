@@ -136,6 +136,7 @@ public:
   bool getTelemetry(Telemetry *telemetry) const;
   bool atTarget() const;
   bool faulted() const;
+  bool setPositionTolerance(float toleranceDeg);
   void resetPid();
   void clearFault();
   void stop();

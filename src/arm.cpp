@@ -317,6 +317,15 @@ bool Arm::getTelemetry(Telemetry *telemetry) const {
 bool Arm::atTarget() const { return atTarget_; }
 bool Arm::faulted() const { return faulted_; }
 
+bool Arm::setPositionTolerance(float toleranceDeg) {
+  if (!(toleranceDeg > 0.0f)) {
+    return false;
+  }
+  config_.shoulder.positionToleranceDeg = toleranceDeg;
+  config_.elbow.positionToleranceDeg = toleranceDeg;
+  return true;
+}
+
 void Arm::resetPid() {
   shoulderState_.velocityDegPerSec = 0.0f;
   shoulderState_.commandedVelocityDegPerSec = 0.0f;

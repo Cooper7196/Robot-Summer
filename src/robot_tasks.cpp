@@ -414,7 +414,7 @@ bool ArmTask::setTargetAngles(const Arm::JointAngles &targetAngles) {
     return false;
   }
   Command command{CommandType::TargetAngles, targetAngles, Arm::Position(),
-                  false};
+                  false, 0.0f};
   const bool queued = xQueueSendToBack(commandQueue_, &command, 0) == pdPASS;
   if (queued) {
     updateStatus(true, false);
@@ -428,12 +428,21 @@ bool ArmTask::setTargetPosition(const Arm::Position &targetPosition,
     return false;
   }
   Command command{CommandType::TargetPosition, Arm::JointAngles(),
-                  targetPosition, elbowUp};
+                  targetPosition, elbowUp, 0.0f};
   const bool queued = xQueueSendToBack(commandQueue_, &command, 0) == pdPASS;
   if (queued) {
     updateStatus(true, false);
   }
   return queued;
+}
+
+bool ArmTask::setPositionTolerance(float toleranceDeg) {
+  if (commandQueue_ == nullptr || !(toleranceDeg > 0.0f)) {
+    return false;
+  }
+  Command command{CommandType::SetPositionTolerance, Arm::JointAngles(),
+                  Arm::Position(), false, toleranceDeg};
+  return xQueueSendToBack(commandQueue_, &command, 0) == pdPASS;
 }
 
 bool ArmTask::getCurrentAngles(Arm::JointAngles *currentAngles) const {
@@ -528,7 +537,7 @@ void ArmTask::cancel() {
     return;
   }
   Command command{CommandType::Cancel, Arm::JointAngles(), Arm::Position(),
-                  false};
+                  false, 0.0f};
   xQueueReset(commandQueue_);
   xQueueSendToBack(commandQueue_, &command, 0);
   updateStatus(false, false);
@@ -546,6 +555,7 @@ void ArmTask::run() {
     Command command;
     if (xQueueReceive(commandQueue_, &command, 0) == pdTRUE) {
       bool accepted = true;
+      bool updateMotionStatus = true;
       if (command.type == CommandType::TargetAngles) {
         xSemaphoreTake(pwmMutex_, portMAX_DELAY);
         accepted = arm_->setTargetAngles(command.angles);
@@ -554,13 +564,20 @@ void ArmTask::run() {
         xSemaphoreTake(pwmMutex_, portMAX_DELAY);
         accepted = arm_->setTargetPosition(command.position, command.elbowUp);
         xSemaphoreGive(pwmMutex_);
+      } else if (command.type == CommandType::SetPositionTolerance) {
+        xSemaphoreTake(pwmMutex_, portMAX_DELAY);
+        accepted = arm_->setPositionTolerance(command.toleranceDeg);
+        xSemaphoreGive(pwmMutex_);
+        updateMotionStatus = false;
       } else {
         xSemaphoreTake(pwmMutex_, portMAX_DELAY);
         arm_->stop();
         xSemaphoreGive(pwmMutex_);
         accepted = false;
       }
-      updateStatus(accepted, false);
+      if (updateMotionStatus) {
+        updateStatus(accepted, false);
+      }
     }
 
     const bool controllerActive = isBusy();

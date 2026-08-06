@@ -66,7 +66,7 @@ constexpr uint16_t kTapeCalibrationMaxProfileSamples = 640;
 constexpr uint32_t kCalibrationSettleDelayMs = 250;
 constexpr float kTapeCalibrationMaxCrossTrackDriftCm = 3.0f;
 constexpr float kTapeCalibrationMaxHeadingDriftDeg = 3.0f;
-constexpr float kTapeCalibrationMaxSensorCenterSpreadCm = 1.0f;
+constexpr float kTapeCalibrationMaxSensorCenterDeviationCm = 1.0f;
 constexpr float kMetalAnomalyThresholdHz = 210.0f;
 constexpr float kMetalThresholdHighBatteryVoltage = 16.8f;
 constexpr float kMetalThresholdLowBatteryVoltage = 14.8f;
@@ -1141,27 +1141,8 @@ bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
     return false;
   }
 
-  float minimumSensorCenterCm = measuredTapeCentersCm[0];
-  float maximumSensorCenterCm = measuredTapeCentersCm[0];
-  for (uint8_t sensor = 1; sensor < validSensorCount; ++sensor) {
-    minimumSensorCenterCm =
-        fminf(minimumSensorCenterCm, measuredTapeCentersCm[sensor]);
-    maximumSensorCenterCm =
-        fmaxf(maximumSensorCenterCm, measuredTapeCentersCm[sensor]);
-  }
-  const float sensorCenterSpreadCm =
-      maximumSensorCenterCm - minimumSensorCenterCm;
-  if (sensorCenterSpreadCm > kTapeCalibrationMaxSensorCenterSpreadCm) {
-    Serial.printf("Tape calibration failed: sensor centers disagree by %.2f cm "
-                  "(limit %.2f cm)\n",
-                  sensorCenterSpreadCm,
-                  kTapeCalibrationMaxSensorCenterSpreadCm);
-    return false;
-  }
-
-  // Use the median of the three independently corrected sensor estimates so
-  // one mislocated edge or noisy sensor cannot pull the calibrated pose away
-  // from the other two.
+  // Sort the three estimates to obtain a robust reference for rejecting an
+  // outlier before averaging the sensors that agree with it.
   if (measuredTapeCentersCm[0] > measuredTapeCentersCm[1]) {
     const float value = measuredTapeCentersCm[0];
     measuredTapeCentersCm[0] = measuredTapeCentersCm[1];
@@ -1177,10 +1158,33 @@ bool calibrateWithMiddleTapeSensor(TapeCalibrationAxis axis,
     measuredTapeCentersCm[0] = measuredTapeCentersCm[1];
     measuredTapeCentersCm[1] = value;
   }
-  const float measuredTapeCenterCm = measuredTapeCentersCm[1];
-  Serial.printf("Tape center median: %.2f cm (%.2f, %.2f, %.2f)\n",
-                measuredTapeCenterCm, measuredTapeCentersCm[0],
-                measuredTapeCentersCm[1], measuredTapeCentersCm[2]);
+  const float medianTapeCenterCm = measuredTapeCentersCm[1];
+  float tapeCenterSumCm = 0.0f;
+  uint8_t inlierSensorCount = 0;
+  for (uint8_t sensor = 0; sensor < validSensorCount; ++sensor) {
+    const float deviationCm =
+        fabsf(measuredTapeCentersCm[sensor] - medianTapeCenterCm);
+    if (deviationCm <= kTapeCalibrationMaxSensorCenterDeviationCm) {
+      tapeCenterSumCm += measuredTapeCentersCm[sensor];
+      ++inlierSensorCount;
+    } else {
+      Serial.printf("Tape center outlier rejected: %.2f cm "
+                    "(deviation %.2f cm)\n",
+                    measuredTapeCentersCm[sensor], deviationCm);
+    }
+  }
+  if (inlierSensorCount < 2) {
+    Serial.println("Tape calibration failed: fewer than two tape center "
+                   "estimates agree");
+    return false;
+  }
+
+  const float measuredTapeCenterCm = tapeCenterSumCm / inlierSensorCount;
+  Serial.printf("Tape center average: %.2f cm from %u/%u inliers "
+                "(%.2f, %.2f, %.2f)\n",
+                measuredTapeCenterCm, inlierSensorCount, validSensorCount,
+                measuredTapeCentersCm[0], measuredTapeCentersCm[1],
+                measuredTapeCentersCm[2]);
 
   // The robot is now slightly beyond the tape because a peak can only be
   // confirmed after the reading falls. Shift the current pose by the error at
@@ -1244,18 +1248,23 @@ bool calibrateYWithMiddleTapeSensor(float knownTapeYCm, float searchDirection,
                                        searchDirection, searchPower);
 }
 
-bool checkForTeletubby() {
-  // Serial2.write('C');
+bool checkForTeletubby(bool firstScan) {
+  Serial2.write('C');
   if (teletubbyCount >= 2) {
     return false;
   }
 
-  cameraDetector.resetPositiveCount();
+  if (firstScan) {
+    cameraDetector.resetPositiveCount();
+  }
   delay(750);
   if (cameraDetector.positiveCount() >= 2) {
     Serial2.write('B');
     blinkLeds(600);
     teletubbyCount++;
+    if (teletubbyCount == 2) {
+      Serial2.write('L');
+    }
     return true;
   }
   return false;
@@ -1324,7 +1333,7 @@ void runPath() {
   // Drive to first rock
   driveTask.setTargetPose({-4.5f, 50.0f, 0.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(5000);
-
+  Serial2.write('L');
   driveTask.setTargetPose({-3.0f, 95.0f, 0.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(5000);
 
@@ -1338,7 +1347,7 @@ void runPath() {
   driveTask.waitUntilMotionFinished(5000);
   driveTask.setTargetPose({-8.0f, 109.0f, 80.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(5000);
-  teletubbyFoundAtRock = checkForTeletubby();
+  teletubbyFoundAtRock = checkForTeletubby(true);
 
   // Pickup rock 1 if it is metal
   if (lastRockMetal) {
@@ -1390,18 +1399,18 @@ void runPath() {
   driveTask.waitUntilMotionFinished(5000);
   driveTask.setTargetPose({-30, 195, 100.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(5000);
-  checkForTeletubby();
+  checkForTeletubby(true);
 
   // Move to scanning position for rock 2
   driveTask.waitUntilMotionFinished(5000);
   driveTask.setTargetPose({-23, 192, 20.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(5000);
-  teletubbyFoundAtRock = checkForTeletubby();
+  teletubbyFoundAtRock = checkForTeletubby(true);
   // Move to second scanning position for rock 2
-  driveTask.setTargetPose({-33, 190, 20.0f}, 1.0f);
+  driveTask.setTargetPose({-32, 187.5, 20.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(5000);
   if (!teletubbyFoundAtRock) {
-    checkForTeletubby();
+    checkForTeletubby(false);
   }
 
   // Grab left rock if it is metal
@@ -1437,7 +1446,7 @@ void runPath() {
   driveTask.setTargetPose({-28.5f, 187.0f, 90.0f}, 1.0f, true);
   driveTask.waitUntilMotionFinished(5000);
   if (!rockHeld) {
-    driveTask.setTargetPose({-49.5f, 183.0f, 145.0f}, 1.0f);
+    driveTask.setTargetPose({-46.5f, 186.0f, 145.0f}, 1.0f);
     driveTask.waitUntilMotionFinished(5000);
 
     driveTask.calibrateImuBlocking(500);
@@ -1449,14 +1458,14 @@ void runPath() {
   // Move to first scanning position for rock 4
   driveTask.setTargetPose({-38.0f, 185.0f, -125.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(5000);
-  teletubbyFoundAtRock = checkForTeletubby();
+  teletubbyFoundAtRock = checkForTeletubby(true);
   // Move to second scanning position for rock 4
-  driveTask.setTargetPose({-45.0f, 170.0f, -180.0f}, 1.0f);
+  driveTask.setTargetPose({-45.0f, 172.0f, -180.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(5000);
-  driveTask.setTargetPose({-70.0f, 170.0f, -180.0f}, 1.0f);
+  driveTask.setTargetPose({-70.0f, 172.0f, -180.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(5000);
   if (!teletubbyFoundAtRock) {
-    checkForTeletubby();
+    checkForTeletubby(false);
   }
 
   // Grab rock 4 if it is metal
@@ -1480,7 +1489,11 @@ void runPath() {
   // Move to scanning position for rock 5 (Up Ramp)
   OtosSensor::Pose curPose;
   driveTask.getCurrentPose(&curPose);
-  curPose.yCm -= 3.0f;
+  if (firstField) {
+    curPose.yCm -= 3.0f;
+  } else {
+    curPose.yCm -= 4.5f;
+  }
   driveTask.setOtosPose(curPose);
 
   driveTask.setTargetPose({curPose.xCm, 150.0f, 180.0f}, 0.8f, true);
@@ -1501,12 +1514,12 @@ void runPath() {
   driveTask.waitUntilMotionFinished(3000);
   driveTask.setTargetPose({-77.0f, 11.5f, 45.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(3000);
-  teletubbyFoundAtRock = checkForTeletubby();
+  teletubbyFoundAtRock = checkForTeletubby(true);
   // Move to second scanning position for rock 5
   driveTask.setTargetPose({-69.0f, 18.0f, 45.0f}, 1.0f);
   driveTask.waitUntilMotionFinished(3000);
   if (!teletubbyFoundAtRock) {
-    checkForTeletubby();
+    checkForTeletubby(false);
   }
 
   // Grab rock 5 if it is metal
@@ -1540,6 +1553,7 @@ void runPath() {
     driveTask.waitUntilMotionFinished(3000);
     Serial2.write('B');
     blinkLeds(600);
+    Serial2.write('L');
   }
 
   // Move to first tape calibration position
@@ -1641,14 +1655,14 @@ void runPath() {
     driveTask.waitUntilMotionFinished(1000);
     delay(500);
     // Move to first habitat position
-    driveTask.setTargetPose({-180.5f, 162.0f, 0.0f}, 0.3f);
+    driveTask.setTargetPose({-180.2f, 162.0f, 0.0f}, 0.3f);
     servo1.setAngle(clawFullyClosedAngle);
-    armTask.setTargetPosition({28.0f, -8.0f}, true);
+    armTask.setTargetPosition({28.0f, -9.0f}, true);
     driveTask.waitUntilMotionFinished(1500);
-    delay(500);
+    armTask.waitUntilSettled(1000);
 
     // Move into first habitat
-    driveTask.setTargetPose({-180.5f, 170.0f, 0.0f}, 0.1f);
+    driveTask.setTargetPose({-180.2f, 170.0f, 0.0f}, 0.1f);
     driveTask.waitUntilMotionFinished(5000);
   } else {
     armTask.setTargetPosition({26.5f, -5.0f}, true);
@@ -1660,7 +1674,7 @@ void runPath() {
     servo1.setAngle(clawFullyClosedAngle);
     armTask.setTargetPosition({28.0f, -8.0f}, true);
     driveTask.waitUntilMotionFinished(1500);
-    delay(500);
+    armTask.waitUntilSettled(1000);
 
     // Move into first habitat
     driveTask.setTargetPose({-178.2f, 170.0f, 0.0f}, 0.1f);
@@ -1733,8 +1747,7 @@ void runPath() {
   driveTask.setTargetPose({-142.5f, 162.0f, 0.0f}, 0.3f);
   driveTask.waitUntilMotionFinished(5000);
   armTask.setTargetPosition({28.0f, -8.0f}, true);
-  armTask.waitUntilSettled(500);
-  delay(500);
+  armTask.waitUntilSettled(1000);
   // Move into second habitat
   driveTask.setTargetPose({-142.5f, 170.0f, 0.0f}, 0.1f);
   driveTask.waitUntilMotionFinished(5000);
@@ -1823,7 +1836,7 @@ void runPath() {
     driveTask.setTargetPose({habitatX, habitatY, 90.0f}, 0.3f);
     driveTask.waitUntilMotionFinished(5000);
   } else {
-    driveTask.setTargetPose({habitatX - 0.5f, habitatY, 90.0f}, 0.3f);
+    driveTask.setTargetPose({habitatX - 1.0f, habitatY, 90.0f}, 0.3f);
     driveTask.waitUntilMotionFinished(5000);
   }
   // Place third habitat
@@ -1882,7 +1895,7 @@ void runPath() {
     driveTask.setTargetPose({habitatX, habitatY, 90.0f}, 0.3f);
     driveTask.waitUntilMotionFinished(5000);
   } else {
-    driveTask.setTargetPose({habitatX - 2.0f, habitatY, 90.0f}, 0.3f);
+    driveTask.setTargetPose({habitatX - 2.5f, habitatY, 90.0f}, 0.3f);
     driveTask.waitUntilMotionFinished(5000);
   }
   // Place fourth habitat
@@ -1901,16 +1914,18 @@ void runPath() {
   moveBackwardManually(30, 450);
 
   Arm::Position solarPanelPickupPosition =
-      firstField ? Arm::Position{26.8f, 5.8f} : Arm::Position{27.2f, 6.0f};
+      firstField ? Arm::Position{27.8f, 5.8f} : Arm::Position{27.2f, 6.0f};
+  armTask.setPositionTolerance(0.5f);
   // Drive to solar panel pickup position
   driveTask.setTargetPose({-144.0f, 96.0f, -90.0f}, 1.0f, true);
   armTask.setTargetPosition(solarPanelPickupPosition, true);
   driveTask.waitUntilMotionFinished(5000);
+  driveTask.setMotionTolerance(0.2f, 1.5f);
   servo1.setAngle(clawOpenAngle);
   if (firstField) {
-    driveTask.setTargetPose({-128.0f, 96.0f, -90.0f}, 0.15f);
+    driveTask.setTargetPose({-131.0f, 96.0f, -90.0f}, 0.15f);
   } else {
-    driveTask.setTargetPose({-131.0f, 94.0f, -90.0f}, 0.15f);
+    driveTask.setTargetPose({-132.5f, 94.0f, -90.0f}, 0.15f);
   }
   driveTask.waitUntilMotionFinished(3000);
   driveTask.cancel();
@@ -2095,7 +2110,9 @@ void setup() {
   armTask.setTargetPosition({20, 6}, true);
   // Serial2.write('B');
   blinkLeds(600);
+  // Serial2.write('L');
   Serial.println("Waiting for drive switch");
+
   while (digitalRead(pins::EXTRA1_PIN) == HIGH) {
     delay(10);
   }
@@ -2114,7 +2131,7 @@ void setup() {
 
   runPath();
 
-  while (true) {
+  while (false) {
     MetalDetector::Reading detectorLeftReading;
     MetalDetector::Reading detectorRightReading;
     const bool detectorLeftValid =
